@@ -1,0 +1,94 @@
+import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+dotenv.config({ path: path.resolve(__dirname, '../../.env') });
+
+/**
+ * Central environment configuration.
+ * All secrets live in environment variables - never hardcode.
+ */
+const env = {
+  NODE_ENV: process.env.NODE_ENV || 'development',
+  PORT: parseInt(process.env.PORT, 10) || 5000,
+  FRONTEND_URL: process.env.FRONTEND_URL || 'http://localhost:5173',
+  MONGODB_URI:
+    process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/travelmind',
+
+  JWT_ACCESS_SECRET: process.env.JWT_ACCESS_SECRET || 'travelmind-access-dev-secret',
+  JWT_REFRESH_SECRET: process.env.JWT_REFRESH_SECRET || 'travelmind-refresh-dev-secret',
+  JWT_ACCESS_EXPIRES_IN: process.env.JWT_ACCESS_EXPIRES_IN || '15m',
+  JWT_REFRESH_EXPIRES_IN: process.env.JWT_REFRESH_EXPIRES_IN || '7d',
+  COOKIE_SECURE: process.env.COOKIE_SECURE === 'true',
+
+  FIREBASE_PROJECT_ID: process.env.FIREBASE_PROJECT_ID || '',
+  // Service account JSON string (preferred) or path to a serviceAccountKey.json
+  FIREBASE_SERVICE_ACCOUNT: process.env.FIREBASE_SERVICE_ACCOUNT || '',
+  FIREBASE_SERVICE_ACCOUNT_PATH: process.env.FIREBASE_SERVICE_ACCOUNT_PATH || '',
+
+  GEMINI_API_KEY: process.env.GEMINI_API_KEY || '',
+  GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-3.5-flash',
+  GEMINI_TIMEOUT_MS: parseInt(process.env.GEMINI_TIMEOUT_MS, 10) || 45000,
+
+  GROQ_API_KEY: process.env.GROQ_API_KEY || '',
+  GROQ_MODEL: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+  GROQ_TIMEOUT_MS: parseInt(process.env.GROQ_TIMEOUT_MS, 10) || 60000,
+
+  // AI itinerary generation time budget. One generateItinerary() attempt must
+  // finish within AI_PLAN_TIMEOUT_MS (and its caller's deadline) so the HTTP
+  // request never exceeds its time limit. Gemini runs alone for up to
+  // AI_PLAN_GEMINI_LEAD_MS; once that elapses (or Gemini fails), Groq is
+  // requested DIRECTLY and the first valid plan wins.
+  AI_PLAN_TIMEOUT_MS: parseInt(process.env.AI_PLAN_TIMEOUT_MS, 10) || 45000,
+  AI_PLAN_GEMINI_LEAD_MS: parseInt(process.env.AI_PLAN_GEMINI_LEAD_MS, 10) || 15000,
+  // Total wall-clock budget for the whole AI planning pipeline (including
+  // replanning attempts). Replan attempts are skipped once this is used up.
+  // Default 40s so worst-case requests still fit under common 60s time limits.
+  AI_PLAN_PIPELINE_TIMEOUT_MS: parseInt(process.env.AI_PLAN_PIPELINE_TIMEOUT_MS, 10) || 40000,
+
+  GEOAPIFY_API_KEY: process.env.GEOAPIFY_API_KEY || '',
+  OPENWEATHER_API_KEY: process.env.OPENWEATHER_API_KEY || '',
+
+  AVIATIONSTACK_API_KEY: process.env.AVIATIONSTACK_API_KEY || '',
+
+  IGNAV_API_KEY: process.env.IGNAV_API_KEY || '',
+
+  // Amadeus is used for HOTELS only (flights use AviationStack).
+  AMADEUS_CLIENT_ID: process.env.AMADEUS_CLIENT_ID || '',
+  AMADEUS_CLIENT_SECRET: process.env.AMADEUS_CLIENT_SECRET || '',
+  AMADEUS_ENV: process.env.AMADEUS_ENV || 'test',
+
+  TRAIN_API_URL: process.env.TRAIN_API_URL || '',
+  TRAIN_API_KEY: process.env.TRAIN_API_KEY || '',
+  // Path of the train search endpoint (RapidAPI: copy from the API docs)
+  TRAIN_API_ENDPOINT: process.env.TRAIN_API_ENDPOINT || '/search',
+  BUS_API_URL: process.env.BUS_API_URL || '',
+  BUS_API_KEY: process.env.BUS_API_KEY || '',
+  BUS_API_ENDPOINT: process.env.BUS_API_ENDPOINT || '/search',
+
+  PAY2ALL_API_KEY: process.env.PAY2ALL_API_KEY || '',
+  PAY2ALL_BASE_URL: process.env.PAY2ALL_BASE_URL || 'https://pay2all.in/api/v1',
+
+  VIATOR_API_KEY: process.env.VIATOR_API_KEY || '',
+  VIATOR_AFFILIATE_ID: process.env.VIATOR_AFFILIATE_ID || '',
+
+  ZOMATO_RAPIDAPI_KEY: process.env.ZOMATO_RAPIDAPI_KEY || '',
+  ZOMATO_RAPIDAPI_HOST: process.env.ZOMATO_RAPIDAPI_HOST || 'zomato4.p.rapidapi.com',
+
+  TICKETMASTER_API_KEY: process.env.TICKETMASTER_API_KEY || '',
+
+  UNSPLASH_ACCESS_KEY: process.env.UNSPLASH_ACCESS_KEY || '',
+
+  SMTP_HOST: process.env.SMTP_HOST || '',
+  SMTP_PORT: parseInt(process.env.SMTP_PORT, 10) || 587,
+  SMTP_USER: process.env.SMTP_USER || '',
+  SMTP_PASS: process.env.SMTP_PASS || '',
+  EMAIL_FROM: process.env.EMAIL_FROM || 'TravelMind AI <no-reply@travelmind.app>',
+};
+
+export const isProduction = env.NODE_ENV === 'production';
+export const isDev = env.NODE_ENV === 'development';
+
+export default env;

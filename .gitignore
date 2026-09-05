@@ -1,0 +1,52 @@
+# Dependencies
+backend/node_modules/
+backend/.env
+frontend/node_modules/
+frontend/.env
+.pnp
+.pnp.js
+
+# Builds
+dist/
+build/
+*.tsbuildinfo
+
+# Environment
+.env
+.env.local
+.env.production
+.env.test
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Testing
+coverage/
+.nyc_output/
+
+# Uploads
+backend/uploads/
+backend/public/uploads/
+
+# Secrets
+*.pem
+*.key
+*.json.enc
+# Firebase service-account private keys (load via FIREBASE_SERVICE_ACCOUNT / _PATH env vars instead)
+firebase-admin.json
+firebase-adminsdk*.json
+
+# Misc
+.cache/
+.tmp/
