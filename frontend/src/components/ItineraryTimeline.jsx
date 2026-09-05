@@ -6,7 +6,7 @@ import {
   RefreshCw, Database, ChevronDown, ChevronUp,
 } from 'lucide-react';
 import { DataStatusBadge } from './ui/Badge';
-import { formatCurrency, formatDateShort } from '../utils/format';
+import { formatCurrency, formatDateShort, resolveActivityPrice } from '../utils/format';
 import { useI18n } from '../utils/i18n';
 
 const CATEGORY_ICON = {
@@ -109,15 +109,31 @@ function ActivityRow({ activity, currency }) {
         )}
       </div>
       <div className="shrink-0 text-right">
-        <p className="text-sm font-extrabold text-slate-900 dark:text-white">
-          {activity.cost?.amount ? formatCurrency(activity.cost.amount, currency) : '—'}
-        </p>
-        {activity.cost?.isEstimate && activity.cost?.amount > 0 && (
-          <p className="text-[10px] font-medium uppercase tracking-wide text-amber-500">{t('estimate')}</p>
-        )}
-        {activity.cost?.perPerson > 0 && (
-          <p className="text-[10px] text-slate-400">≈ {formatCurrency(activity.cost.perPerson, currency)}{t('/person')}</p>
-        )}
+        {(() => {
+          const { price, suffix, isEstimate, isFree } = resolveActivityPrice(activity.cost);
+          if (price === null) {
+            // Defensive only — the backend pricing fallback always assigns a
+            // price (0 = free) to every displayable item.
+            return <p className="text-sm font-extrabold text-slate-900 dark:text-white">—</p>;
+          }
+          if (isFree) {
+            return <p className="text-sm font-extrabold text-emerald-600 dark:text-emerald-400">{t('Free')}</p>;
+          }
+          return (
+            <>
+              <p className="text-sm font-extrabold text-slate-900 dark:text-white">
+                {formatCurrency(price, currency)}
+                {suffix ? <span className="text-xs font-semibold text-slate-500 dark:text-slate-400"> {suffix}</span> : ''}
+              </p>
+              {isEstimate && (
+                <p className="text-[10px] font-medium uppercase tracking-wide text-amber-500">{t('estimate')}</p>
+              )}
+              {activity.cost?.perPerson > 0 && (
+                <p className="text-[10px] text-slate-400">≈ {formatCurrency(activity.cost.perPerson, currency)}{t('/person')}</p>
+              )}
+            </>
+          );
+        })()}
       </div>
     </motion.div>
   );

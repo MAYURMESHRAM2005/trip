@@ -97,9 +97,19 @@ export default function SavedTrips() {
                   <Link to={`/budget?trip=${trip._id}`} className="btn-secondary px-3 py-2 text-xs">
                     <Wallet className="h-3.5 w-3.5" />
                   </Link>
-                  <a href={tripApi.pdfUrl(trip._id)} target="_blank" rel="noreferrer" className="btn-secondary px-3 py-2 text-xs">
+                  <button
+                    onClick={async () => {
+                      try {
+                        await tripApi.downloadPdf(trip._id, `itinerary-${String(trip.destination || 'trip').toLowerCase().replace(/[^a-z0-9]+/g, '-')}.pdf`);
+                      } catch (err) {
+                        alert(err.message || t('PDF download failed'));
+                      }
+                    }}
+                    className="btn-secondary px-3 py-2 text-xs"
+                    title={t('Download PDF')}
+                  >
                     <Download className="h-3.5 w-3.5" />
-                  </a>
+                  </button>
                   <button onClick={() => deleteTrip.mutate(trip._id)} className="btn-secondary px-3 py-2 text-xs text-rose-500">
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>

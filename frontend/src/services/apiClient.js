@@ -1,4 +1,5 @@
 import api from './api';
+import { useAuthStore } from '../store/authStore';
 
 /**
  * All backend endpoints as small functions. Components never call axios directly.
@@ -37,10 +38,21 @@ export const tripApi = {
   makeCheaper: (id) => api.post(`/trips/${id}/make-cheaper`),
   replaceHotel: (id) => api.post(`/trips/${id}/replace-hotel`),
   moveActivity: (id, payload) => api.post(`/trips/${id}/activities/move`, payload),
-  pdfUrl: (id) => `/api/trips/${id}/pdf`,
-  budgetPdfUrl: (id) => `/api/trips/${id}/budget-pdf`,
   chat: (id, payload) => api.post(`/trips/${id}/chat`, payload),
+
+  /**
+   * Download a trip PDF as a blob and trigger a browser download.
+   * Used instead of a plain <a href target="_blank"> link, which opens a
+   * useless blank tab (and breaks where the frontend isn't proxied).
+   */
+  downloadPdf: async (id, filename = 'itinerary.pdf') => {
+    await downloadBlob(`/trips/${id}/pdf`, filename);
+  },
+  downloadBudgetPdf: async (id, filename = 'budget-report.pdf') => {
+    await downloadBlob(`/trips/${id}/budget-pdf`, filename);
+  },
 };
+
 
 export const hotelsApi = {
   search: (params) => api.get('/hotels/search', { params }),
@@ -161,5 +173,38 @@ export const adminApi = {
 export const healthApi = {
   check: () => api.get('/health'),
 };
+
+/**
+ * Fetch a binary file (PDF) from the backend as a blob and save it locally.
+ * Same base URL, credentials and auth header as the axios client — works in
+ * dev (via the Vite proxy) and in production (VITE_API_URL points at the
+ * backend), without navigating the browser or opening a blank tab.
+ */
+async function downloadBlob(urlPath, filename) {
+  const base = import.meta.env.VITE_API_URL || '/api';
+  const url = `${base}${urlPath}`;
+  const token = useAuthStore.getState().accessToken;
+  const headers = token ? { Authorization: `Bearer ${token}` } : {};
+  const res = await fetch(url, { credentials: 'include', headers });
+  if (!res.ok) {
+    let message = `Download failed (${res.status})`;
+    try {
+      const body = await res.json();
+      if (body?.message) message = body.message;
+    } catch {
+      // non-JSON error body — keep the status message
+    }
+    throw new Error(message);
+  }
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 5000);
+}
 
 export default { authApi, userApi, tripApi, hotelsApi, flightsApi, trainsApi, busesApi, restaurantsApi, placesApi, mapsApi, geocodeApi, routesApi, weatherApi, currencyApi, chatApi, voiceApi, expensesApi, ticketsApi, emergencyApi, notificationsApi, translateApi, adminApi, healthApi };

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatCurrency, formatDate, daysBetween, initials, cn, toQueryString, todayISO } from './format';
+import { formatCurrency, formatDate, daysBetween, initials, cn, toQueryString, todayISO, resolveActivityPrice } from './format';
 
 describe('formatCurrency', () => {
   it('formats INR amounts', () => {
@@ -10,6 +10,35 @@ describe('formatCurrency', () => {
     expect(formatCurrency(null)).toBe('—');
     expect(formatCurrency(undefined)).toBe('—');
     expect(formatCurrency(NaN)).toBe('—');
+  });
+  it('formats zero as ₹0 (free items must not render a dash)', () => {
+    expect(formatCurrency(0, 'INR')).toContain('0');
+    expect(formatCurrency(0, 'INR')).not.toBe('—');
+  });
+});
+
+describe('resolveActivityPrice', () => {
+  it('uses displayAmount when present (check-in nightly rate, display-only)', () => {
+    const res = resolveActivityPrice({ amount: 0, displayAmount: 1400, displaySuffix: '/ room/night', isEstimate: true });
+    expect(res.price).toBe(1400);
+    expect(res.suffix).toBe('/ room/night');
+    expect(res.isEstimate).toBe(true);
+    expect(res.isFree).toBe(false);
+  });
+  it('flags amount 0 as free', () => {
+    const res = resolveActivityPrice({ amount: 0, isEstimate: true });
+    expect(res.price).toBe(0);
+    expect(res.isFree).toBe(true);
+  });
+  it('keeps a positive amount untouched', () => {
+    const res = resolveActivityPrice({ amount: 12128, isEstimate: false });
+    expect(res.price).toBe(12128);
+    expect(res.isEstimate).toBe(false);
+    expect(res.isFree).toBe(false);
+  });
+  it('returns null price only when nothing is set (defensive dash)', () => {
+    expect(resolveActivityPrice({}).price).toBe(null);
+    expect(resolveActivityPrice(undefined).price).toBe(null);
   });
 });
 

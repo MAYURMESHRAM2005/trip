@@ -74,9 +74,18 @@ export default function ItineraryPage() {
         actions={
           <>
             <TripSelect value={trip._id} onChange={(id) => id && navigate(`/itinerary/${id}`)} />
-            <a href={tripApi.pdfUrl(trip._id)} target="_blank" rel="noreferrer" className="btn-secondary">
+            <button
+              onClick={async () => {
+                try {
+                  await tripApi.downloadPdf(trip._id, `itinerary-${String(trip.destination || 'trip').toLowerCase().replace(/[^a-z0-9]+/g, '-')}.pdf`);
+                } catch (err) {
+                  alert(err.message || t('PDF download failed'));
+                }
+              }}
+              className="btn-secondary"
+            >
               <Download className="h-4 w-4" /> {t('PDF')}
-            </a>
+            </button>
             <Link to={`/budget?trip=${trip._id}`} className="btn-secondary">
               <Wand2 className="h-4 w-4" /> {t('Optimize budget')}
             </Link>

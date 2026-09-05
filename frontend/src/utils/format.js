@@ -11,6 +11,28 @@ export function formatCurrency(amount, currency = 'INR') {
   }
 }
 
+/**
+ * Resolve the price an itinerary activity should display.
+ *
+ * Canonical cost shape (produced by the backend pricing service):
+ *   cost: { amount, currency, isEstimate, perPerson, estimateNote,
+ *           displayAmount?, displaySuffix? }
+ *  - displayAmount (when present) is a display-only price, e.g. the nightly
+ *    rate shown on a hotel check-in row that is not added to day totals.
+ *  - amount 0 means the item is free (rendered "Free", never a dash).
+ * Returns { price, suffix, isEstimate, isFree }.
+ */
+export function resolveActivityPrice(cost = {}) {
+  const raw = cost.displayAmount != null ? cost.displayAmount : cost.amount;
+  const price = typeof raw === 'number' && !Number.isNaN(raw) ? raw : null;
+  return {
+    price,
+    suffix: cost.displaySuffix || '',
+    isEstimate: cost.isEstimate === true,
+    isFree: price === 0,
+  };
+}
+
 /** Today's date as YYYY-MM-DD (local time) — used to disable past dates on date inputs. */
 export function todayISO() {
   const d = new Date();

@@ -16,13 +16,14 @@ export default function Badge({ tone = 'slate', className, children }) {
 }
 
 /**
- * Data-status pill: live / estimate / unavailable.
+ * Data-status pill: live / curated / estimate. Unknown statuses render as an
+ * estimate — the UI never shows a raw "Live data unavailable" error.
  */
 export function DataStatusBadge({ status }) {
   const { t } = useI18n();
   if (status === 'live') return <Badge tone="green">● {t('Live data')}</Badge>;
-  if (status === 'estimate') return <Badge tone="amber">≈ {t('Estimate')}</Badge>;
-  return <Badge tone="rose">{t('Live data unavailable')}</Badge>;
+  if (status === 'curated') return <Badge tone="violet">≈ {t('Curated')}</Badge>;
+  return <Badge tone="amber">≈ {t('Estimate')}</Badge>;
 }
 
 export function ProviderStatusBadge({ configured }) {

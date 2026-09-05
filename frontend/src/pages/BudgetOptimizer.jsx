@@ -415,9 +415,18 @@ export default function BudgetOptimizer() {
         subtitle={`${trip.title} · ${trip.destination} · ${daysBetween(trip.startDate, trip.endDate)} days`}
         actions={
           <>
-            <a href={tripApi.budgetPdfUrl(trip._id)} target="_blank" rel="noreferrer" className="btn-secondary">
+            <button
+              onClick={async () => {
+                try {
+                  await tripApi.downloadBudgetPdf(trip._id, `budget-${String(trip.destination || 'trip').toLowerCase().replace(/[^a-z0-9]+/g, '-')}.pdf`);
+                } catch (err) {
+                  alert(err.message || t('PDF download failed'));
+                }
+              }}
+              className="btn-secondary"
+            >
               <Download className="h-4 w-4" /> {t('Download budget PDF')}
-            </a>
+            </button>
             <TripSelect value={trip._id} onChange={(id) => id && navigate(`/budget?trip=${id}`)} />
           </>
         }
