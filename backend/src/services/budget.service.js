@@ -119,7 +119,12 @@ export function sumCosts(items) {
 /**
  * Optimize an itinerary's estimated costs down to fit a budget.
  *
- * @param items       array of {id, category, amount, droppable, priority}
+ * Reduces ESTIMATED costs proportionally — live/verified prices are never
+ * touched and nothing is dropped/zeroed (a removed item would otherwise
+ * render as "Free" for something that is not free). The reductions are
+ * applied so the stored plan itself stays within budget.
+ *
+ * @param items       array of {id, category, amount, flexible, priority}
  * @param budget      total budget (number)
  * @param options     { emergencyReserve } amount that must remain untouched
  * @returns {original, optimized, saved, remaining, dropped, reductions, withinBudget}
@@ -127,43 +132,41 @@ export function sumCosts(items) {
 export function optimizeCosts(items, budget, { emergencyReserve = 0 } = {}) {
   const original = sumCosts(items);
   const target = Math.max(0, budget - emergencyReserve);
-  let current = original;
   const reductions = [];
   const dropped = [];
 
-  // 1. Drop droppable low-priority items first (priority = higher dropped first)
-  const droppable = items
-    .filter((i) => i.droppable)
-    .sort((a, b) => (b.priority || 1) - (a.priority || 1));
+  // Only estimates can flex — live/verified prices are preserved exactly.
+  const flexible = items.filter((i) => i.flexible);
+  const fixed = items.filter((i) => !i.flexible);
+  const fixedTotal = sumCosts(fixed);
+  const flexibleTotal = sumCosts(flexible);
 
-  for (const item of droppable) {
-    if (current <= target) break;
-    current -= Number(item.amount) || 0;
-    dropped.push(item);
-  }
+  let current = original;
+  let factor = 1;
 
-  // 2. If still over, apply a proportional reduction to flexible items so the
-  //    plan converges to the target budget (reductions stay flagged as estimates)
-  const flexible = items.filter((i) => !dropped.includes(i) && i.flexible);
-  if (current > target && flexible.length) {
-    const over = current - target;
-    const flexibleTotal = sumCosts(flexible);
-    if (flexibleTotal > 0) {
-      const factor = Math.max(0, Math.min(1, (flexibleTotal - over) / flexibleTotal));
-      for (const item of flexible) {
-        const newAmount = Math.round(Number(item.amount) * factor);
-        reductions.push({
-          id: item.id,
-          category: item.category,
-          from: item.amount,
-          to: newAmount,
-          note: `Reduced ${item.category} cost to fit budget`,
-        });
-      }
-      current =
-        sumCosts(flexible.map((i) => ({ amount: i.amount * factor }))) +
-        sumCosts(items.filter((i) => !dropped.includes(i) && !flexible.includes(i)));
+  if (current > target && flexibleTotal > 0) {
+    // If unavoidable live costs alone exceed the target, no reduction of
+    // estimates can bring the plan under budget. Apply only a modest trim
+    // (never fake prices) and report the shortfall honestly.
+    if (fixedTotal > target) {
+      factor = 0.8;
+    } else {
+      // Scale estimates so the plan converges to the target. A floor of 0.5
+      // keeps estimates realistic instead of driving them to zero.
+      factor = Math.max(0.5, Math.min(1, (flexibleTotal - (current - target)) / flexibleTotal));
     }
+    for (const item of flexible) {
+      // Floor per item so rounding can never push the final total over budget.
+      const newAmount = Math.floor(Number(item.amount) * factor);
+      reductions.push({
+        id: item.id,
+        category: item.category,
+        from: item.amount,
+        to: newAmount,
+        note: `Reduced ${item.category} cost to fit budget`,
+      });
+    }
+    current = sumCosts(flexible.map((i) => ({ amount: Math.floor(Number(i.amount) * factor) }))) + fixedTotal;
   }
 
   const saved = Math.max(0, original - current);
@@ -172,7 +175,7 @@ export function optimizeCosts(items, budget, { emergencyReserve = 0 } = {}) {
     optimized: Math.round(current * 100) / 100,
     saved: Math.round(saved * 100) / 100,
     remaining: Math.round(Math.max(0, budget - current) * 100) / 100,
-    dropped: dropped.map((d) => ({ id: d.id, category: d.category, amount: d.amount })),
+    dropped,
     reductions,
     withinBudget: current <= budget,
   };

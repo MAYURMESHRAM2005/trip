@@ -1,11 +1,14 @@
 import placesProvider from '../providers/places.provider.js';
 import viatorProvider from '../providers/viator.provider.js';
+import { curatedPlaces, filterPlacesForDestination } from '../services/destination.service.js';
 import logger from '../utils/logger.js';
 
 /**
- * Attraction Agent: real Places attractions from Geoapify.
- * Now purely provider-based — no Gemini calls. Attractions are returned
- * directly from the provider.
+ * Attraction Agent: real Places attractions from Geoapify, constrained to the
+ * destination. Results are validated against the destination (country + radius)
+ * BEFORE they reach the itinerary, and destination-specific curated attractions
+ * fill any gaps so the itinerary is never empty or globally wrong.
+ * Now purely provider-based — no Gemini calls.
  */
 class AttractionAgent {
   constructor() {
@@ -16,37 +19,69 @@ class AttractionAgent {
   get systemPrompt() { return this._systemPrompt; }
   set systemPrompt(v) { this._systemPrompt = v; }
 
-  async run({ destination, interests, activityLevel }) {
-    logger.entry('[AGENT:attraction]', 'run', { destination, interests, activityLevel });
+  async run({ destination, interests, activityLevel, destinationInfo }) {
+    logger.entry('[AGENT:attraction]', 'run', { destination, interests, activityLevel, hasDestInfo: Boolean(destinationInfo) });
     const started = Date.now();
-    const providerResult = await placesProvider.textSearch({
-      query: `${destination} top tourist attractions`,
-      type: 'tourist_attraction',
-      limit: 30,
-    });
 
-    if (!providerResult.isLive) {
+    // ── 1. Live search anchored at destination coords (never global text) ──
+    let providerResult = null;
+    if (destinationInfo?.latitude != null) {
+      providerResult = await placesProvider.nearbySearch({
+        lat: destinationInfo.latitude,
+        lng: destinationInfo.longitude,
+        type: 'tourist_attraction',
+        radius: 30000,
+        limit: 30,
+        countryCode: destinationInfo.countryCode,
+        destinationInfo,
+      });
+    } else {
+      providerResult = await placesProvider.textSearch({
+        query: destinationInfo?.city || destination,
+        type: 'tourist_attraction',
+        limit: 30,
+        countryCode: destinationInfo?.countryCode,
+        destinationInfo,
+      });
+    }
+
+    let attractions = providerResult?.isLive ? (providerResult.data || []) : [];
+
+    // ── 2. Destination validation (belt-and-braces — providers validated too) ──
+    if (destinationInfo) {
+      attractions = filterPlacesForDestination(attractions, destinationInfo, { category: 'attraction' }).kept;
+    }
+
+    // ── 3. Curated fill — real destination places when live data is thin ──
+    const curated = curatedPlaces(destinationInfo, 'attractions');
+    const seen = new Set(attractions.map((a) => String(a.name || '').toLowerCase()).filter(Boolean));
+    for (const c of curated) {
+      if (seen.has(String(c.name || '').toLowerCase())) continue;
+      attractions.push(c);
+      seen.add(String(c.name || '').toLowerCase());
+      if (attractions.length >= 30) break;
+    }
+
+    const usedCurated = attractions.filter((a) => a.source === 'curated').length;
+
+    if (!attractions.length) {
       return {
         agent: this.name,
         status: 'degraded',
-        data: { attractions: [], isLive: false, message: providerResult.message },
-        message: providerResult.message,
+        data: { attractions: [], isLive: false, message: 'No destination-specific attractions available.' },
+        message: 'No destination-specific attractions available.',
         latencyMs: 0,
         usedAI: false,
         source: 'provider',
       };
     }
 
-    let attractions = providerResult.data || [];
-
-    // Fetch opening hours for ALL attractions with valid placeIds.
-    // The batchPlaceDetails function uses an in-memory cache (24h TTL) so
-    // previously-fetched places return instantly with zero API credits.
-    const placeIds = attractions.map((a) => a.placeId).filter(Boolean);
+    // ── 4. Opening hours enrichment (live places only) ──
+    const livePlaces = attractions.filter((a) => a.source !== 'curated');
+    const placeIds = livePlaces.map((a) => a.placeId).filter(Boolean);
     if (placeIds.length > 0) {
       try {
         const detailsMap = await placesProvider.batchPlaceDetails(placeIds, { concurrency: 8 });
-        // Merge opening hours into attractions
         for (const attr of attractions) {
           const details = detailsMap.get(attr.placeId);
           if (details?.openingHours) {
@@ -54,29 +89,26 @@ class AttractionAgent {
             attr.openingHoursRaw = details.openingHoursRaw;
           }
         }
-        const withHours = attractions.filter((a) => a.openingHours).length;
-        const cacheSize = placesProvider.getDetailsCacheSize();
-        logger.info(`[AGENT:attraction] Enriched ${withHours}/${placeIds.length} attractions with opening hours (cache: ${cacheSize} entries)`);
       } catch (err) {
         logger.warn(`[AGENT:attraction] Failed to fetch opening hours: ${err.message}`);
       }
     }
 
-    // Enrich attractions with Viator real pricing (entry fees, tour prices)
+    // ── 5. Viator real pricing enrichment (live places only) ──
     let withViatorPricing = 0;
     try {
-      const attractionNames = attractions.map((a) => a.name).filter(Boolean);
+      const attractionNames = livePlaces.map((a) => a.name).filter(Boolean);
       const viatorMap = await viatorProvider.enrichAttractionsWithPricing(
-        destination,
+        destinationInfo?.city || destination,
         attractionNames,
         'INR',
         { maxPerAttraction: 2, maxTotal: 8 },
       );
       for (const attr of attractions) {
+        if (attr.source === 'curated') continue; // curated entry fees are estimates
         const lowerName = (attr.name || '').toLowerCase();
         const viatorProducts = viatorMap.get(lowerName);
         if (viatorProducts?.length) {
-          // Pick the best-priced product as the entry fee reference
           const withPrice = viatorProducts.filter((p) => p.fromPrice?.amount > 0);
           const cheapest = withPrice.sort((a, b) => a.fromPrice.amount - b.fromPrice.amount)[0];
           if (cheapest) {
@@ -102,24 +134,23 @@ class AttractionAgent {
           }
         }
       }
-      logger.info(`[AGENT:attraction] Enriched ${withViatorPricing}/${attractions.length} attractions with Viator pricing`);
     } catch (err) {
       logger.warn(`[AGENT:attraction] Viator pricing enrichment failed: ${err.message}`);
     }
 
-    logger.exit('[AGENT:attraction]', 'run', { status: 'success', count: attractions.length, withOpeningHours: attractions.filter((a) => a.openingHours).length, latencyMs: Date.now() - started });
+    logger.exit('[AGENT:attraction]', 'run', { status: 'success', count: attractions.length, curated: usedCurated, latencyMs: Date.now() - started });
 
     return {
       agent: this.name,
       status: 'success',
       data: {
         attractions,
-        isLive: true,
+        isLive: livePlaces.length > 0,
         dailyPlan: [],
-        notes: `Attraction data from Geoapify (${attractions.length} options, ${attractions.filter((a) => a.openingHours).length} with opening hours, ${withViatorPricing} with Viator pricing)`,
+        notes: `Attraction data from Geoapify (${livePlaces.length} live, ${usedCurated} curated, ${withViatorPricing} with Viator pricing)`,
         viatorEnriched: withViatorPricing,
       },
-      message: `Attraction data from provider (${attractions.length} options, ${withViatorPricing} with real pricing)`,
+      message: `Attraction data (${livePlaces.length} live, ${usedCurated} curated, ${withViatorPricing} with real pricing)`,
       latencyMs: Date.now() - started,
       usedAI: false,
       source: 'provider',

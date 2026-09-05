@@ -1,6 +1,8 @@
 import env from '../config/env.js';
 import { live, unavailable, axiosGet } from './base.provider.js';
 import logger from '../utils/logger.js';
+import mapsProvider from './maps.provider.js';
+import { validatePlaceForDestination, filterPlacesForDestination } from '../services/destination.service.js';
 
 /**
  * Geoapify Places provider.
@@ -48,8 +50,11 @@ function key() {
   return env.GEOAPIFY_API_KEY;
 }
 
+// Only Geoapify-valid categories go here — an invalid category makes the API
+// return 400 and forces the (previously global) fallback path, which is how
+// unrelated world-wide results leaked into Nagpur itineraries.
 const CATEGORY_MAP = {
-  tourist_attraction: 'tourism.sights,tourism.attraction,tourism.monument',
+  tourist_attraction: 'tourism.sights,tourism.attraction',
   restaurant: 'catering.restaurant',
   hotel: 'accommodation.hotel',
   hospital: 'healthcare.hospital',
@@ -60,9 +65,9 @@ const CATEGORY_MAP = {
   embassy: 'office.diplomatic',
   cafe: 'catering.cafe',
   bar: 'catering.bar',
-  nightlife: 'entertainment.nightclub,catering.bar',
-  viewpoint: 'tourism.viewpoint',
-  beach: 'natural.beach',
+  nightlife: 'catering.bar',
+  viewpoint: 'tourism.sights',
+  beach: 'tourism.attraction',
   market: 'commercial.marketplace',
   shopping: 'commercial.shopping_mall',
 };
@@ -88,6 +93,10 @@ function mapResult(f) {
     county: p.county || '',
     city: p.city || '',
     state: p.state || '',
+    // Country fields power destination validation — a place whose country
+    // does not match the destination is discarded before reaching the UI.
+    country: p.country || '',
+    countryCode: (p.country_code || p.countryCode || '').toUpperCase(),
     openNow: null,
     photoRef: '',
     distanceMeters: p.distance ?? null,
@@ -98,107 +107,132 @@ function mapResult(f) {
 }
 
 async function apiGet(url, params) {
-  const qs = new URLSearchParams({ apiKey: key(), ...params });
+  const qs = new URLSearchParams({ apiKey: key() });
+  for (const [k, v] of Object.entries(params || {})) {
+    if (Array.isArray(v)) {
+      // Geoapify combines filters via repeated params, e.g. two `filter=`
+      // values (circle + countrycode). A comma-joined single value 400s.
+      for (const item of v) qs.append(k, item);
+    } else if (v != null && v !== '') {
+      qs.set(k, v);
+    }
+  }
   return axiosGet(`${url}?${qs}`, {}, 8000);
 }
 
 /**
  * Text search — restaurants, attractions, hotels by keyword.
- * Uses Geoapify Places with a spatial bias when coordinates are available;
- * falls back to amenity geocoding for text-only queries.
+ *
+ * NEVER performs an unbounded global text search: a bare `text=Nagpur` query
+ * matches places named "Nagpur" anywhere on Earth (León, Mexico; New Zealand;
+ * South Africa). The search is always anchored to destination coordinates
+ * (circle filter + proximity bias + country filter). When no coordinates are
+ * given, the query is geocoded first with a country restriction.
  */
-export async function textSearch({ query, lat, lng, radius = 5000, type = 'tourist_attraction', limit = 10 }) {
-  logger.entry('[PROVIDER:places]', 'textSearch', { query, type, limit, hasCoords: lat != null && lng != null });
+export async function textSearch({ query, lat, lng, radius = 5000, type = 'tourist_attraction', limit = 10, countryCode, destinationInfo }) {
+  logger.entry('[PROVIDER:places]', 'textSearch', { query, type, limit, hasCoords: lat != null && lng != null, countryCode });
   const started = Date.now();
   if (!key()) return unavailable('geoapify', 'Geoapify API key not configured');
 
-  // Places API first. Errors and empty results both fall through to the
-  // amenity-geocode fallback below (the API may reject text-only queries).
-  let features = [];
+  // ── 1. Resolve the geographic anchor ───────────────────────────────
+  // Coordinates can come from the caller, from the resolved destination, or
+  // by geocoding the query itself (with a country filter) — never a global
+  // unconstrained lookup.
+  let anchor = null;
+  if (lat != null && lng != null) anchor = { lat, lng };
+  else if (destinationInfo?.latitude != null) anchor = { lat: destinationInfo.latitude, lng: destinationInfo.longitude };
+  if (!anchor) {
+    try {
+      const geo = await mapsProvider.geocode(query, { countryCode: countryCode || destinationInfo?.countryCode });
+      if (geo.isLive && geo.data?.lat != null) anchor = { lat: geo.data.lat, lng: geo.data.lng };
+    } catch {
+      anchor = null;
+    }
+  }
+  if (!anchor) {
+    return unavailable('geoapify', `Could not geocode "${query}" — place search cannot be anchored to a destination.`);
+  }
+
+  const cc = String(countryCode || destinationInfo?.countryCode || '').toLowerCase();
+  const filters = [`circle:${anchor.lng},${anchor.lat},${radius}`];
+  if (cc) filters.push(`countrycode:${cc}`);
+
+  // ── 2. Places API — spatially constrained ──────────────────────────
+  let results = [];
   try {
-    const params = {
+    const data = await apiGet(PLACES_URL, {
       text: query,
       categories: CATEGORY_MAP[type] || type,
       limit: Math.min(Number(limit) || 10, 35),
       lang: 'en',
       format: 'json',
-    };
-    if (lat != null && lng != null) {
-      params.filter = `circle:${lng},${lat},${radius}`;
-      params.bias = `proximity:${lng},${lat}`;
-    }
-    const data = await apiGet(PLACES_URL, params);
-    features = data?.features || [];
+      filter: filters,
+      bias: `proximity:${anchor.lng},${anchor.lat}`,
+    });
+    results = (data?.features || []).slice(0, limit).map(mapResult);
   } catch {
-    features = [];
+    results = [];
   }
 
-  if (features.length) {
-    const results = features.slice(0, limit).map(mapResult);
+  // ── 3. Validate every result against the destination ───────────────
+  if (destinationInfo) {
+    results = filterPlacesForDestination(results, destinationInfo, { category: type }).kept;
+  }
+
+  if (results.length) {
     logger.provider('geoapify', 'textSearch', { isLive: true, count: results.length, latencyMs: Date.now() - started });
     return live('geoapify', results, 'Live data from Geoapify');
   }
 
-  // Text-only fallback: geocode the query as an amenity (e.g. "restaurants in Goa")
+  // ── 4. Recall fallback: category-only nearby search around the anchor ──
+  // (text matching can return nothing even when places exist nearby)
   try {
-    const g = await apiGet(GEOCODE_URL, {
-      text: query,
-      type: 'amenity',
-      limit: Math.min(Number(limit) || 10, 35),
-      format: 'json',
-      lang: 'en',
+    const nearby = await nearbySearch({
+      lat: anchor.lat,
+      lng: anchor.lng,
+      type,
+      radius,
+      limit,
+      countryCode: cc || undefined,
+      destinationInfo,
     });
-    const results = g?.results || [];
-    if (!results.length) {
-      return unavailable('geoapify', `Places search failed: no results for "${query}"`);
+    if (nearby.isLive) {
+      logger.provider('geoapify', 'textSearch (nearby fallback)', { isLive: true, count: nearby.data.length, latencyMs: Date.now() - started });
+      return nearby;
     }
-    const fallbackResults = results.slice(0, limit).map((r) => ({
-        placeId: r.place_id || '',
-        name: r.name || r.formatted || '',
-        address: r.formatted || '',
-        coordinates: r.lat != null && r.lon != null ? { lat: r.lat, lng: r.lon } : null,
-        rating: null,
-        userRatingsTotal: null,
-        priceLevel: null,
-        types: r.result_type ? [r.result_type] : [],
-        openNow: null,
-        photoRef: '',
-        distanceMeters: null,
-        businessStatus: '',
-        url: '',
-        website: '',
-    }));
-    logger.provider('geoapify', 'textSearch (fallback geocode)', { isLive: true, count: fallbackResults.length, latencyMs: Date.now() - started });
-    return live(
-      'geoapify',
-      fallbackResults,
-      'Live data from Geoapify'
-    );
-  } catch (err) {
-    logger.error(`[PROVIDER:places] textSearch error: ${err.message}`);
-    return unavailable('geoapify', `Live data unavailable: ${err.message}`);
+  } catch {
+    // fall through
   }
+
+  return unavailable('geoapify', `No ${type} found within ${radius}m of the destination.`);
 }
 
-/** Nearby search — hospitals, police, ATMs, pharmacies, transit near a point. */
-export async function nearbySearch({ lat, lng, type = 'hospital', radius = 5000, limit = 12 }) {
-  logger.entry('[PROVIDER:places]', 'nearbySearch', { type, radius, limit, lat, lng });
+/** Nearby search — places of a category within a circle around a point. */
+export async function nearbySearch({ lat, lng, type = 'hospital', radius = 5000, limit = 12, countryCode, destinationInfo }) {
+  logger.entry('[PROVIDER:places]', 'nearbySearch', { type, radius, limit, lat, lng, countryCode });
   const started = Date.now();
   if (!key()) return unavailable('geoapify', 'Geoapify API key not configured');
   try {
     if (lat == null || lng == null) {
       return unavailable('geoapify', 'Nearby search requires coordinates');
     }
+    const cc = String(countryCode || '').toLowerCase();
+    const filters = [`circle:${lng},${lat},${radius}`];
+    if (cc) filters.push(`countrycode:${cc}`);
     const data = await apiGet(PLACES_URL, {
       categories: CATEGORY_MAP[type] || type,
-      filter: `circle:${lng},${lat},${radius}`,
+      filter: filters,
       bias: `proximity:${lng},${lat}`,
       limit: Math.min(Number(limit) || 12, 35),
       lang: 'en',
       format: 'json',
     });
     const features = data?.features || [];
-    const results = features.slice(0, limit).map(mapResult);
+    let results = features.slice(0, limit).map(mapResult);
+    // Destination validation — drop anything outside the destination region.
+    if (destinationInfo) {
+      results = filterPlacesForDestination(results, destinationInfo, { category: type }).kept;
+    }
     logger.provider('geoapify', 'nearbySearch', { isLive: true, count: results.length, latencyMs: Date.now() - started });
     return live('geoapify', results, 'Live data from Geoapify');
   } catch (err) {

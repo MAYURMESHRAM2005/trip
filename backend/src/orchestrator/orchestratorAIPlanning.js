@@ -14,6 +14,9 @@ import env from '../config/env.js';
 import logger from '../utils/logger.js';
 import { generateItinerary, getRequestCount } from '../services/itineraryGenerator.service.js';
 import finalValidatorAgent from '../agents/finalValidator.agent.js';
+import pricingService from '../services/pricing.service.js';
+import budgetService from '../services/budget.service.js';
+import itineraryService from '../services/itinerary.service.js';
 import { haversineKm } from '../utils/geo.js';
 
 const MAX_REPLAN_ATTEMPTS = 3;
@@ -292,7 +295,26 @@ export function normalizeCandidates({ attractions, restaurants, nightlife, hotel
  * Every factual field (price, coordinates, address, rating, openingHours, etc.)
  * comes from the candidate dataset, NEVER from AI output.
  */
-export function resolveProviderIds(aiDays, candidates) {
+/**
+ * Map a clock time to the meal it represents (for restaurant costs).
+ */
+function mealSlotForTime(startTime) {
+  const h = parseInt(String(startTime || '').split(':')[0], 10);
+  if (Number.isNaN(h)) return 'dinner';
+  if (h < 11) return 'breakfast';
+  if (h < 16) return 'lunch';
+  return 'dinner';
+}
+
+/**
+ * Resolve AI planning decisions against the candidate dataset.
+ *
+ * @param {Array} aiDays - AI-proposed days ({ date, theme, items[] })
+ * @param {Array} candidates - normalized candidate dataset
+ * @param {object} ctx - pricing context: { partySize, currency, hotelNightly,
+ *   rooms, outboundEstimate, returnEstimate, localTransportDaily }
+ */
+export function resolveProviderIds(aiDays, candidates, ctx = {}) {
   const candidateMap = new Map();
   for (const c of candidates) {
     const key = `${c.provider}|${c.providerId}`;
@@ -333,11 +355,13 @@ export function resolveProviderIds(aiDays, candidates) {
         continue;
       }
 
+      const mealSlot = item.type === 'restaurant' ? mealSlotForTime(item.startTime) : null;
+
       // Build full activity from candidate data
       const act = {
         // Time (from AI planning decision)
         time: item.startTime || '09:00',
-        slot: mapTimeSlot(item.startTime, item.type),
+        slot: mealSlot || mapTimeSlot(item.startTime, item.type),
         period: mapPeriod(item.startTime),
 
         // Identity (from AI planning decision, validated against candidate)
@@ -360,8 +384,14 @@ export function resolveProviderIds(aiDays, candidates) {
           ? { lat: candidate.latitude, lng: candidate.longitude }
           : null,
 
-        // Cost (always from candidate)
-        cost: buildCostFromCandidate(candidate, item.type),
+        // Type + entry-fee data preserved so later pricing passes can tell a
+        // confirmed-free attraction apart from an unpriced one.
+        types: Array.isArray(candidate.types) ? candidate.types : [],
+        entryFee: candidate.entryFee || null,
+
+        // Cost (always from candidate, estimates via the centralized pricing
+        // service when the provider has no price)
+        cost: buildCostFromCandidate(candidate, item.type, { ...ctx, mealSlot, title: item.title || candidate.name }),
 
         // Data status (always from candidate)
         source: candidate.source || candidate.provider,
@@ -431,83 +461,165 @@ function mapPeriod(startTime) {
   return 'night';
 }
 
-/** Build cost object from candidate data. */
-function buildCostFromCandidate(candidate, type) {
-  // Hotels: nightly rate from candidate
+/**
+ * Build cost object from candidate data. Real provider prices are always
+ * preserved; missing prices fall back to the centralized category-based
+ * estimates in pricing.service (flagged ESTIMATE).
+ */
+function buildCostFromCandidate(candidate, type, ctx = {}) {
+  const partySize = Math.max(1, Number(ctx.partySize) || 1);
+  const currency = candidate.currency || ctx.currency || 'INR';
+
+  // Hotels: nightly rate from candidate (budget-capped), × rooms per night.
+  // Check-in rows are display-only (nightly rate shown, not charged); the
+  // overnight row carries the charge exactly once per night. This mirrors the
+  // deterministic plan so hotel cost is never multiplied by check-in +
+  // overnight rows or by an arbitrary room count.
   if (type === 'hotel') {
-    if (candidate.pricePerNight > 0) {
+    const rooms = Math.max(1, Number(ctx.rooms) || 1);
+    const title = String(ctx.title || '');
+    const liveNightly = candidate.pricePerNight > 0 ? candidate.pricePerNight : null;
+    // ctx.hotelNightly is already budget-capped (min of live recommended price
+    // and the per-room-per-night accommodation allocation).
+    const nightly = liveNightly != null && liveNightly > 0
+      ? (ctx.hotelNightly > 0 ? Math.min(liveNightly, ctx.hotelNightly) : liveNightly)
+      : (ctx.hotelNightly > 0 ? ctx.hotelNightly : 1200);
+    const capped = liveNightly != null && ctx.hotelNightly > 0 && liveNightly > ctx.hotelNightly;
+
+    if (/check[\s-]*out/i.test(title)) {
+      return { amount: 0, perPerson: 0, currency, isEstimate: true, estimateNote: 'Checkout — no charge', source: 'none' };
+    }
+    if (/check[\s-]*in/i.test(title)) {
       return {
-        amount: candidate.pricePerNight,
-        currency: candidate.currency || 'INR',
-        isEstimate: Boolean(candidate.isEstimate),
+        amount: 0,
+        perPerson: 0,
+        currency,
+        isEstimate: Boolean(candidate.isEstimate) || capped,
+        displayAmount: Math.round(nightly * 100) / 100,
+        displaySuffix: '/ room/night',
+        estimateNote: 'Nightly rate — charged on the overnight entry',
         source: candidate.source || candidate.provider,
       };
     }
-    return { amount: 0, currency: 'INR', isEstimate: true, source: 'budget-estimate' };
+    // Overnight / stay row: charge nightly × rooms (one night).
+    const charge = Math.round(nightly * rooms * 100) / 100;
+    return {
+      amount: charge,
+      perPerson: Math.round((charge / partySize) * 100) / 100,
+      currency,
+      isEstimate: Boolean(candidate.isEstimate) || capped,
+      estimateNote: !capped && liveNightly != null
+        ? `Live price · ${nightly}/room/night × ${rooms} room(s)`
+        : `Estimated ${nightly}/room/night × ${rooms} room(s) — capped to accommodation budget`,
+      source: candidate.source || candidate.provider,
+    };
   }
 
-  // Transport: price from candidate
+  // Transport: price from candidate, budget estimate as fallback
   if (type === 'transport' || type === 'flight' || type === 'train' || type === 'bus') {
     if (candidate.price > 0) {
       return {
         amount: candidate.price,
-        currency: candidate.currency || 'INR',
+        currency,
         isEstimate: Boolean(candidate.isEstimate),
         source: candidate.source || candidate.provider,
       };
     }
-    return { amount: 0, currency: 'INR', isEstimate: true, source: 'budget-estimate' };
+    const est = ctx.outboundEstimate > 0 ? ctx.outboundEstimate : 1000;
+    return {
+      amount: Math.round(est * 100) / 100,
+      perPerson: Math.round((est / partySize) * 100) / 100,
+      currency,
+      isEstimate: true,
+      estimateNote: 'Estimated transport fare — no live pricing available from provider',
+      source: 'budget-estimate',
+    };
   }
 
-  // Attractions: entry fee from candidate
+  // Attractions: entry fee from candidate, budget-capped category estimate as
+  // fallback (a missing price is never treated as Free unless the data source
+  // explicitly confirms free entry).
   if (type === 'attraction') {
     if (candidate.price > 0) {
       return {
-        amount: candidate.price,
-        currency: candidate.currency || 'INR',
+        amount: Math.round(candidate.price * partySize * 100) / 100,
+        perPerson: candidate.price,
+        currency,
         isEstimate: Boolean(candidate.isEstimate),
         source: candidate.source || candidate.provider,
         estimateNote: candidate.isEstimate ? `Estimated from ${candidate.provider}` : `Real price from ${candidate.provider}`,
       };
     }
-    return { amount: 0, currency: 'INR', isEstimate: true, source: 'estimate', estimateNote: 'Free / unknown entry fee' };
+    return {
+      ...pricingService.attractionCost(
+        { name: candidate.name, types: candidate.types || [], entryFee: candidate.entryFee },
+        currency,
+        partySize,
+        ctx.maxActivityPerPerson
+      ),
+    };
   }
 
-  // Restaurants: average cost from candidate
+  // Restaurants: average cost from candidate, meal estimate as fallback
   if (type === 'restaurant') {
     const cost = candidate.averageCostPerPerson || candidate.price || 0;
     if (cost > 0) {
       return {
-        amount: cost,
-        currency: candidate.currency || 'INR',
+        amount: Math.round(cost * partySize * 100) / 100,
+        perPerson: cost,
+        currency,
         isEstimate: Boolean(candidate.isEstimate),
         source: candidate.source || candidate.provider,
-        estimateNote: candidate.hasZomatoData
-          ? `Real average from Zomato × party size`
-          : `Estimated from ${candidate.provider} priceLevel`,
+        estimateNote: candidate.zomatoData
+          ? 'Real average cost from Zomato × party size'
+          : `Estimated from ${candidate.provider} price data`,
       };
     }
-    return { amount: 0, currency: 'INR', isEstimate: true, source: 'budget-estimate' };
+    return {
+      ...pricingService.restaurantMealCost(
+        { name: candidate.name, priceLevel: candidate.priceLevel, source: candidate.source },
+        ctx.mealSlot || 'dinner',
+        partySize,
+        currency,
+        ctx.maxMealPerPerson
+      ),
+    };
   }
 
   // Events: price from candidate
   if (type === 'event') {
     if (candidate.price > 0) {
       return {
-        amount: candidate.price,
-        currency: candidate.currency || 'INR',
+        amount: Math.round(candidate.price * partySize * 100) / 100,
+        perPerson: candidate.price,
+        currency,
         isEstimate: Boolean(candidate.isEstimate),
         source: candidate.source || candidate.provider,
       };
     }
     if (candidate.isFree) {
-      return { amount: 0, currency: 'INR', isEstimate: false, source: 'ticketmaster' };
+      return { amount: 0, perPerson: 0, currency, isEstimate: false, source: 'ticketmaster', estimateNote: 'Free event' };
     }
-    return { amount: 0, currency: 'INR', isEstimate: true, source: 'estimate' };
+    // Ticket price unknown → reasonable varied estimate, never Free.
+    const perPerson = 150 + ((String(candidate.name || '').length % 4) * 50);
+    return {
+      amount: Math.round(perPerson * partySize * 100) / 100,
+      perPerson,
+      currency,
+      isEstimate: true,
+      source: 'estimate',
+      estimateNote: `Estimated ticket price ~${perPerson}/person — no live pricing available from provider`,
+    };
   }
 
-  // Nightlife: typically free or cover charge
-  return { amount: 0, currency: 'INR', isEstimate: true, source: 'estimate' };
+  // Nightlife: cover estimate for clubs/bars, free otherwise
+  return {
+    ...pricingService.attractionCost(
+      { name: candidate.name, types: candidate.types || ['nightlife'] },
+      currency,
+      partySize
+    ),
+  };
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -534,7 +646,7 @@ export function rebuildCosts(days, { partySize = 1, totalBudget = 0, currency = 
       else if (act.category === 'restaurant' && slot === 'breakfast') breakdown.breakfast += amt;
       else if (act.category === 'restaurant' && slot === 'lunch') breakdown.lunch += amt;
       else if (act.category === 'restaurant') breakdown.dinner += amt;
-      else if (act.category === 'transport') breakdown.transport += amt;
+      else if (['transport', 'flight', 'train', 'bus'].includes(act.category)) breakdown.transport += amt;
       else if (slot === 'evening') breakdown.evening += amt;
       else if (slot === 'night') breakdown.night += amt;
       else if (act.category === 'attraction' || act.category === 'activity') breakdown.activities += amt;
@@ -691,13 +803,72 @@ export async function runAIPlanningPipeline(opts) {
     }
 
     // ═══ STEP 3: Resolve provider IDs ═══
+    // Pricing context for the centralized fallback: real provider prices are
+    // preserved; anything missing becomes a category estimate flagged ESTIMATE.
+    const partySize = Math.max(1, (travelers?.adults || 1) + (travelers?.children || 0));
+    const rooms = budgetService.roomsForParty({ adults: travelers?.adults || 1, children: travelers?.children || 0 });
+    const recommendedNightly = hotelResult?.data?.recommended?.price?.amount || 0;
+    const allocPerRoomNight = nightsCount > 0 && rooms > 0 ? (allocation?.hotels?.amount || 0) / nightsCount / rooms : 0;
+    // Budget-capped nightly rate: the live recommended price is used only when
+    // it fits the per-room-per-night accommodation allocation; otherwise the
+    // allocation wins so the plan never goes over budget on hotels.
+    const hotelNightly = allocPerRoomNight > 0
+      ? Math.min(recommendedNightly > 0 ? recommendedNightly : allocPerRoomNight, allocPerRoomNight * 1.05)
+      : (recommendedNightly > 0 ? recommendedNightly : 1200);
+    const transportAlloc = allocation?.transport?.amount || 0;
+    const foodAlloc = allocation?.food?.amount || 0;
+    const activityAlloc = allocation?.activities?.amount || 0;
+    const pricingCtx = {
+      partySize,
+      currency,
+      rooms,
+      hotelNightly,
+      maxHotelNightly: allocPerRoomNight,
+      maxMealPerPerson: Math.round((foodAlloc / Math.max(1, daysCount) / 3 / partySize) * 100) / 100,
+      maxActivityPerPerson: Math.round((activityAlloc / Math.max(1, daysCount) / partySize) * 100) / 100,
+      outboundEstimate: Math.round(transportAlloc * 0.35 * 100) / 100,
+      returnEstimate: Math.round(transportAlloc * 0.35 * 100) / 100,
+      localTransportDaily: Math.round((transportAlloc * 0.3) / Math.max(1, daysCount) * 100) / 100,
+    };
     const { resolved, resolvedCount, unresolvedCount } = resolveProviderIds(
       aiResult.itinerary.days,
-      candidates
+      candidates,
+      pricingCtx
     );
 
     // ═══ STEP 4: Rebuild costs from resolved data ═══
-    const partySize = Math.max(1, (travelers?.adults || 1) + (travelers?.children || 0));
+    rebuildCosts(resolved, { partySize, totalBudget, currency });
+
+    // ═══ STEP 4a: Central pricing normalization + budget trim ═══
+    // Ensure no displayable item is left at ₹0/missing (except genuinely free
+    // items), then reduce ESTIMATED costs if the resolved plan is over the
+    // user's budget. Live/verified prices are never touched.
+    pricingService.normalizeItineraryPrices(resolved, pricingCtx);
+    if (totalBudget != null && totalBudget > 0) {
+      const items = itineraryService.toCostItems(resolved, currency);
+      const opt = budgetService.optimizeCosts(items, totalBudget, {
+        emergencyReserve: allocation?.emergencyReserve?.amount || 0,
+      });
+      if (opt.reductions.length) {
+        const dayByKey = {};
+        for (const day of resolved) {
+          (day.activities || []).forEach((act, i) => {
+            dayByKey[itineraryService.activityItemId(day.dayNumber, i)] = act;
+          });
+        }
+        for (const r of opt.reductions) {
+          const act = dayByKey[r.id];
+          if (act && act.cost) {
+            act.cost.amount = Math.round(r.to * 100) / 100;
+            act.cost.isEstimate = true;
+            act.cost.estimateNote = r.note;
+            if (act.cost.perPerson != null) {
+              act.cost.perPerson = Math.round((act.cost.amount / partySize) * 100) / 100;
+            }
+          }
+        }
+      }
+    }
     rebuildCosts(resolved, { partySize, totalBudget, currency });
 
     const resolvedTotalCost = resolved.reduce((sum, d) => sum + (d.dayCost || 0), 0);

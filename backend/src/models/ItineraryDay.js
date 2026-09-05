@@ -33,6 +33,11 @@ const activitySchema = new mongoose.Schema(
       isEstimate: { type: Boolean, default: true },
       perPerson: { type: Number },
       estimateNote: { type: String, default: '' },
+      // Display-only price (e.g. nightly rate on the check-in row) — shown in
+      // the UI but never added to day totals, so accommodation is not
+      // double-counted.
+      displayAmount: { type: Number },
+      displaySuffix: { type: String, default: '' },
     },
     source: { type: String, default: 'ai-generated' }, // provider | ai-generated | user | estimate | none
     fetchedAt: { type: String, default: '' },

@@ -967,7 +967,7 @@ class FinalValidatorAgent {
         
         // Check for non-estimate cost without provider source
         if (act.cost?.isEstimate === false && act.source) {
-          const validSources = ['provider', 'geoapify', 'amadeus-hotels', 'viator', 'zomato', 'ticketmaster', 'aviationstack'];
+          const validSources = ['provider', 'geoapify', 'amadeus-hotels', 'viator', 'zomato', 'ticketmaster', 'aviationstack', 'curated'];
           if (!validSources.includes(act.source)) {
             issues.push(createValidationError(
               ERROR_TYPES.PRICE_FABRICATED,
@@ -1377,7 +1377,7 @@ class FinalValidatorAgent {
         }
         // Fabrication check: non-estimate cost without valid provider source
         if (act.cost?.isEstimate === false && act.source) {
-          const validSources = ['provider', 'geoapify', 'amadeus-hotels', 'viator', 'zomato', 'ticketmaster', 'aviationstack'];
+          const validSources = ['provider', 'geoapify', 'amadeus-hotels', 'viator', 'zomato', 'ticketmaster', 'aviationstack', 'curated'];
           if (!validSources.includes(act.source)) {
             issues.push(createValidationError(ERROR_TYPES.PRICE_FABRICATED, day.dayNumber, act.providerId || null, `"${act.title}" claims non-estimate cost but source is "${act.source}"`));
           }

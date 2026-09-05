@@ -35,43 +35,47 @@ test('sumCosts sums amounts ignoring non-amount fields', () => {
   assert.equal(sumCosts(items), 350.5);
 });
 
-test('optimizeCosts drops low-priority items when over budget', () => {
+test('optimizeCosts reduces flexible estimates to fit the budget (never drops to Free)', () => {
   const budget = 1000;
   const items = [
-    { id: 'a', category: 'hotel', amount: 600, droppable: false, priority: 1 },
-    { id: 'b', category: 'attraction', amount: 300, droppable: true, priority: 2 },
-    { id: 'c', category: 'attraction', amount: 400, droppable: true, priority: 3 },
-    { id: 'd', category: 'restaurant', amount: 200, droppable: true, priority: 2 },
+    { id: 'hotel', category: 'hotel', amount: 600, droppable: false, priority: 1, flexible: true },
+    { id: 'b', category: 'attraction', amount: 300, flexible: true },
+    { id: 'c', category: 'attraction', amount: 400, flexible: true },
+    { id: 'd', category: 'restaurant', amount: 200, flexible: true },
   ];
   const result = optimizeCosts(items, budget, { emergencyReserve: 0 });
   assert.ok(result.withinBudget, 'result should fit budget');
-  assert.equal(result.saved, 700, 'saved should equal dropped 700 (400+300)');
-  assert.equal(result.dropped.length, 2);
-  assert.equal(result.dropped[0].id, 'c', 'highest priority number (most droppable) dropped first');
+  assert.equal(result.dropped.length, 0, 'nothing is dropped into a fake Free');
+  assert.ok(result.reductions.length > 0, 'estimates are reduced proportionally');
+  assert.ok(result.reductions.every((r) => r.to > 0), 'no estimate is reduced to zero');
 });
 
-test('optimizeCosts preserves must-keep items even over budget', () => {
+test('optimizeCosts never touches live/must-keep prices and reports honestly when unfixable', () => {
   const budget = 500;
   const items = [
-    { id: 'flight', category: 'flight', amount: 800, droppable: false, priority: 1 },
-    { id: 'fun', category: 'activity', amount: 300, droppable: true, priority: 3 },
+    { id: 'flight', category: 'flight', amount: 800, droppable: false, priority: 1, flexible: false },
+    { id: 'fun', category: 'activity', amount: 300, flexible: true },
   ];
   const result = optimizeCosts(items, budget);
-  assert.equal(result.dropped.length, 1);
-  assert.equal(result.optimized, 800, 'must-keep flight stays');
+  assert.equal(result.dropped.length, 0);
+  // Live cost (800) alone exceeds the budget → only a modest trim applies to
+  // the estimate and the shortfall is reported honestly.
+  assert.ok(result.reductions.every((r) => r.id !== 'flight'), 'live price is never reduced');
+  assert.equal(result.optimized, 800 + Math.floor(300 * 0.8), 'live flight stays untouched');
   assert.equal(result.withinBudget, false, 'still over budget - flagged honestly');
 });
 
-test('optimizeCosts reduces flexible items when dropping is not enough', () => {
+test('optimizeCosts reduces flexible items when live costs alone exceed the budget', () => {
   const budget = 1000;
   const items = [
-    { id: 'hotel', category: 'hotel', amount: 900, droppable: false, priority: 1 },
-    { id: 'food1', category: 'restaurant', amount: 400, droppable: false, priority: 1, flexible: true },
-    { id: 'food2', category: 'restaurant', amount: 300, droppable: false, priority: 1, flexible: true },
+    { id: 'flight', category: 'flight', amount: 1100, droppable: false, priority: 1, flexible: false },
+    { id: 'food1', category: 'restaurant', amount: 400, flexible: true },
+    { id: 'food2', category: 'restaurant', amount: 300, flexible: true },
   ];
   const result = optimizeCosts(items, budget);
-  assert.ok(result.reductions.length > 0, 'should apply reductions');
-  assert.ok(result.optimized <= budget + 1, 'optimized should fit budget');
+  assert.ok(result.reductions.length > 0, 'estimates are trimmed modestly even when live costs overrun');
+  assert.ok(result.reductions.every((r) => r.to >= r.from * 0.5), 'estimates are never made artificially cheap');
+  assert.equal(result.withinBudget, false, 'still flagged over budget honestly');
 });
 
 test('optimizeCosts with no overspend leaves everything untouched', () => {

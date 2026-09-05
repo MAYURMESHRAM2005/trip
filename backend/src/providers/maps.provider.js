@@ -117,12 +117,21 @@ async function resolveCoordinates(place) {
 
 /* -------------------------------- exports -------------------------------- */
 
-export async function geocode(address) {
-  logger.entry('[PROVIDER:maps]', 'geocode', { address });
+export async function geocode(address, { country = '', countryCode = '', limit = 1 } = {}) {
+  logger.entry('[PROVIDER:maps]', 'geocode', { address, country, countryCode });
   const started = Date.now();
   if (!key()) return unavailable('geoapify', 'Geoapify API key not configured');
   try {
-    const data = await apiGet(GEOCODE_URL, { text: address, limit: 1, format: 'json', lang: 'en' });
+    const params = {
+      text: address,
+      limit: Math.min(Number(limit) || 1, 5),
+      format: 'json',
+      lang: 'en',
+    };
+    // Constrain the geocode to the destination country — never a global guess.
+    if (countryCode) params.filter = `countrycode:${String(countryCode).toLowerCase()}`;
+    else if (country) params.country = country;
+    const data = await apiGet(GEOCODE_URL, params);
     const r = data?.results?.[0];
     if (!r) return unavailable('geoapify', `Geocoding failed: no results for "${address}"`);
     logger.provider('geoapify', 'geocode', { isLive: true, latencyMs: Date.now() - started });
@@ -131,6 +140,12 @@ export async function geocode(address) {
       lat: r.lat,
       lng: r.lon,
       placeId: r.place_id || '',
+      city: r.city || r.name || '',
+      state: r.state || '',
+      country: r.country || '',
+      countryCode: (r.country_code || '').toUpperCase(),
+      timezone: r.timezone?.name || '',
+      resultType: r.result_type || '',
     });
   } catch (err) {
     logger.error(`[PROVIDER:maps] geocode error: ${err.message}`);

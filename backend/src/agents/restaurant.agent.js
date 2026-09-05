@@ -1,11 +1,12 @@
 import placesProvider from '../providers/places.provider.js';
 import zomatoProvider from '../providers/zomato.provider.js';
+import { curatedPlaces, filterPlacesForDestination } from '../services/destination.service.js';
 import logger from '../utils/logger.js';
 
 /**
- * Restaurant Agent: real Geoapify Places results.
- * Now purely provider-based — no Gemini calls. Restaurants are returned
- * directly from the provider, sorted by relevance.
+ * Restaurant Agent: real Geoapify Places results constrained to the
+ * destination, validated against it, with destination-specific curated
+ * restaurants/cafes filling any gaps. No Gemini calls.
  */
 class RestaurantAgent {
   constructor() {
@@ -16,51 +17,82 @@ class RestaurantAgent {
   get systemPrompt() { return this._systemPrompt; }
   set systemPrompt(v) { this._systemPrompt = v; }
 
-  async run({ destination, foodPreference }) {
-    logger.entry('[AGENT:restaurant]', 'run', { destination, foodPreference });
+  async run({ destination, foodPreference, destinationInfo }) {
+    logger.entry('[AGENT:restaurant]', 'run', { destination, foodPreference, hasDestInfo: Boolean(destinationInfo) });
     const started = Date.now();
-    const providerResult = await placesProvider.textSearch({
-      query: `${destination} best restaurants`,
-      type: 'restaurant',
-      limit: 20,
-    });
 
-    if (!providerResult.isLive) {
+    // ── 1. Live search anchored at destination coords (never global text) ──
+    let providerResult = null;
+    if (destinationInfo?.latitude != null) {
+      providerResult = await placesProvider.nearbySearch({
+        lat: destinationInfo.latitude,
+        lng: destinationInfo.longitude,
+        type: 'restaurant',
+        radius: 15000,
+        limit: 20,
+        countryCode: destinationInfo.countryCode,
+        destinationInfo,
+      });
+    } else {
+      providerResult = await placesProvider.textSearch({
+        query: destinationInfo?.city || destination,
+        type: 'restaurant',
+        limit: 20,
+        countryCode: destinationInfo?.countryCode,
+        destinationInfo,
+      });
+    }
+
+    let restaurants = providerResult?.isLive ? (providerResult.data || []) : [];
+
+    // ── 2. Destination validation ──
+    if (destinationInfo) {
+      restaurants = filterPlacesForDestination(restaurants, destinationInfo, { category: 'restaurant' }).kept;
+    }
+
+    // ── 3. Curated fill — real destination restaurants + cafes ──
+    const curated = [...curatedPlaces(destinationInfo, 'restaurants'), ...curatedPlaces(destinationInfo, 'cafes')];
+    const seen = new Set(restaurants.map((r) => String(r.name || '').toLowerCase()).filter(Boolean));
+    for (const c of curated) {
+      if (seen.has(String(c.name || '').toLowerCase())) continue;
+      restaurants.push(c);
+      seen.add(String(c.name || '').toLowerCase());
+      if (restaurants.length >= 20) break;
+    }
+
+    const usedCurated = restaurants.filter((r) => r.source === 'curated').length;
+    const liveCount = restaurants.length - usedCurated;
+
+    if (!restaurants.length) {
       return {
         agent: this.name,
         status: 'degraded',
-        data: { restaurants: [], recommendations: [], isLive: false, message: providerResult.message },
-        message: providerResult.message,
+        data: { restaurants: [], recommendations: [], isLive: false, message: 'No destination-specific restaurants available.' },
+        message: 'No destination-specific restaurants available.',
         latencyMs: 0,
         usedAI: false,
         source: 'provider',
       };
     }
 
-    const restaurants = providerResult.data || [];
-    logger.info(`[AGENT:restaurant] Got ${restaurants.length} restaurants from Geoapify`);
-
-    // Enrich restaurants with Zomato real ratings and average meal costs
+    // ── 4. Zomato real rating/cost enrichment (live places only) ──
     let withZomatoData = 0;
     try {
-      const restaurantNames = restaurants.map((r) => r.name).filter(Boolean);
-      const zomatoMap = await zomatoProvider.enrichRestaurants(destination, restaurantNames, { maxSearches: 5 });
+      const liveNames = restaurants.filter((r) => r.source !== 'curated').map((r) => r.name).filter(Boolean);
+      const zomatoMap = await zomatoProvider.enrichRestaurants(destinationInfo?.city || destination, liveNames, { maxSearches: 5 });
       for (const r of restaurants) {
+        if (r.source === 'curated') continue;
         const lowerName = (r.name || '').toLowerCase();
         const zomato = zomatoMap.get(lowerName);
         if (zomato) {
-          // Use Zomato's real ratings (replace null Geoapify ratings)
           if (zomato.rating != null) r.rating = zomato.rating;
           if (zomato.votes) r.reviewCount = zomato.votes;
-          // Use Zomato's real average cost for two (replaces priceLevel estimate)
           if (zomato.averageCostForTwo > 0) {
             r.averageCostForTwo = zomato.averageCostForTwo;
             r.averageCostPerPerson = zomato.averageCostPerPerson;
             r.priceRange = zomato.priceRange;
           }
-          // Merge cuisine data (Zomato is more specific)
           if (zomato.cuisines?.length) r.cuisines = zomato.cuisines;
-          // Store Zomato source info
           r.zomatoData = {
             rating: zomato.rating,
             votes: zomato.votes,
@@ -76,7 +108,7 @@ class RestaurantAgent {
           withZomatoData++;
         }
       }
-      logger.info(`[AGENT:restaurant] Enriched ${withZomatoData}/${restaurants.length} restaurants with Zomato data`);
+      logger.info(`[AGENT:restaurant] Enriched ${withZomatoData}/${liveCount} live restaurants with Zomato data`);
     } catch (err) {
       logger.warn(`[AGENT:restaurant] Zomato enrichment failed: ${err.message}`);
     }
@@ -93,19 +125,19 @@ class RestaurantAgent {
       types: r.types,
     }));
 
-    logger.exit('[AGENT:restaurant]', 'run', { status: 'success', count: restaurants.length, withZomato: withZomatoData, latencyMs: Date.now() - started });
+    logger.exit('[AGENT:restaurant]', 'run', { status: 'success', count: restaurants.length, live: liveCount, curated: usedCurated, withZomato: withZomatoData, latencyMs: Date.now() - started });
     return {
       agent: this.name,
       status: 'success',
       data: {
         restaurants,
         recommendations,
-        isLive: true,
+        isLive: liveCount > 0,
         mealPlan: [],
-        notes: `Restaurant data from Geoapify (${restaurants.length} options, ${withZomatoData} with Zomato real pricing)`,
+        notes: `Restaurant data from Geoapify (${liveCount} live, ${usedCurated} curated, ${withZomatoData} with Zomato real pricing)`,
         zomatoEnriched: withZomatoData,
       },
-      message: `Restaurant data from provider (${restaurants.length} options, ${withZomatoData} with real pricing)`,
+      message: `Restaurant data (${liveCount} live, ${usedCurated} curated, ${withZomatoData} with real pricing)`,
       latencyMs: Date.now() - started,
       usedAI: false,
       source: 'provider',

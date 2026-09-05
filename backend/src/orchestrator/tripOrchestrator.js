@@ -26,6 +26,7 @@ import { runAIPlanningPipeline } from './orchestratorAIPlanning.js';
 import placesProvider from '../providers/places.provider.js';
 import mapsProvider from '../providers/maps.provider.js';
 import transportIntel from '../services/transportIntelligence.service.js';
+import destinationService from '../services/destination.service.js';
 import { notifyTripPlanned, notifyBudgetOptimized } from '../services/notification.service.js';
 
 function fmtDate(d) {
@@ -193,10 +194,29 @@ export async function generateTrip({ user, request }) {
   }
   report.push(destinationAgent.report(destinationResult || { status: 'success', message: `Destination provided: ${destination}` }));
 
+  // Resolve the destination to a structured geographic entity (city/state/
+  // country/countryCode/coordinates). Every provider search and every place
+  // is validated against this before it can reach the itinerary.
+  let destinationInfo = null;
+  try {
+    destinationInfo = await destinationService.resolveDestination(destination);
+  } catch (err) {
+    logger.warn(`[ORCHESTRATOR] Destination resolution failed: ${err.message}`);
+  }
+  if (!destinationInfo) destinationInfo = destinationService.getDestinationInfoSync(destination);
+  logger.info(`[ORCHESTRATOR] Destination resolved: ${JSON.stringify({ city: destinationInfo?.city, state: destinationInfo?.state, countryCode: destinationInfo?.countryCode, lat: destinationInfo?.latitude, lng: destinationInfo?.longitude, source: destinationInfo?.source })}`);
+
   const allocation = budgetService.allocationForStyle(prefs.travelStyle || 'standard', totalBudget);
   logger.info(`[ORCHESTRATOR] Budget allocation for style '${prefs.travelStyle || 'standard'}': ${JSON.stringify(Object.keys(allocation))}`);
   const rooms = budgetService.roomsForParty({ adults: request.adults, children: request.children });
-  logger.info(`[ORCHESTRATOR] Rooms needed: ${rooms}, Days: ${daysCount}, Destination: ${destination}`);
+  const hotelNights = Math.max(0, daysCount - 1);
+  // Per-room-per-night accommodation budget (hotels are spread across nights
+  // and rooms), so the hotel agent never recommends a room rate that exceeds
+  // what the trip budget can actually support.
+  const hotelPerRoomNight = (allocation.hotels?.amount || 0) > 0 && hotelNights > 0 && rooms > 0
+    ? (allocation.hotels.amount / hotelNights / rooms)
+    : (allocation.hotels?.amount || 0);
+  logger.info(`[ORCHESTRATOR] Rooms needed: ${rooms}, Days: ${daysCount}, Hotel nights: ${hotelNights}, per-room-night budget: ${hotelPerRoomNight}, Destination: ${destination}`);
 
   // ══════════════════════════════════════════════════════════════════════
   // BATCH 2: All external provider API calls in PARALLEL via Promise.all
@@ -235,19 +255,20 @@ export async function generateTrip({ user, request }) {
         checkOut: fmtDate(request.endDate),
         adults: request.adults,
         rooms,
-        maxPrice: allocation.hotels?.amount,
+        maxPrice: hotelPerRoomNight,
         totalBudget,
         hotelPreference: prefs.hotelPreference,
         userId,
+        destinationInfo,
       }),
       'hotel'
     ),
     runWithTimeout(
-      () => attractionAgent.run({ destination, interests: prefs.interests, activityLevel: prefs.activityLevel, userId }),
+      () => attractionAgent.run({ destination, interests: prefs.interests, activityLevel: prefs.activityLevel, userId, destinationInfo }),
       'attraction'
     ),
     runWithTimeout(
-      () => restaurantAgent.run({ destination, foodPreference: prefs.foodPreference, userId }),
+      () => restaurantAgent.run({ destination, foodPreference: prefs.foodPreference, userId, destinationInfo }),
       'restaurant'
     ),
     runWithTimeout(
@@ -491,6 +512,7 @@ export async function generateTrip({ user, request }) {
     budgetAllocation: allocation,
     totalBudget,
     currency,
+    destinationInfo,
   });
   const days = plan.days;
   let totalEstimatedCost = itineraryService.computeItineraryCost(days);
@@ -624,6 +646,13 @@ export async function generateTrip({ user, request }) {
   const finalDays = aiPlanSuccess ? aiPlanningResult.days : days;
   const usedAIPlan = aiPlanSuccess;
 
+  // The stored total must exactly match the sum of the displayed item prices
+  // in the days we actually persist (the AI plan may price items differently
+  // from the deterministic plan it replaced).
+  totalEstimatedCost = itineraryService.computeItineraryCost(finalDays);
+  isOverBudget = totalBudget != null && totalEstimatedCost > totalBudget;
+  logger.info(`[ORCHESTRATOR] Final plan total: ${totalEstimatedCost} (over budget: ${isOverBudget}, AI plan: ${usedAIPlan})`);
+
   logger.info(`[ORCHESTRATOR] AI planning result: ${statusLabel}, using ${usedAIPlan ? 'AI' : 'deterministic'} plan (${finalDays.length} days)`);
   report.push({
     agent: 'ai-planning-pipeline',
@@ -654,6 +683,11 @@ export async function generateTrip({ user, request }) {
   } : plan.optimized;
   if (optimized && allocation.emergencyReserve && !optimized.emergencyReserve) {
     optimized = { ...optimized, emergencyReserve: allocation.emergencyReserve.amount };
+  }
+  // When the AI plan replaced the deterministic days, keep the reported
+  // optimized total in sync with the days we persist.
+  if (optimized && usedAIPlan) {
+    optimized = { ...optimized, optimized: totalEstimatedCost, withinBudget: !isOverBudget };
   }
 
   const extras = itineraryService.buildItineraryExtras({
@@ -741,8 +775,10 @@ export async function generateTrip({ user, request }) {
     agentReport: report,
     validation: {
       passed: usedAIPlan ? (aiPlanningResult.validation?.passed ?? validation.data?.passed) : validation.data?.passed,
-      issues: usedAIPlan ? (aiPlanningResult.validation?.issues || validation.data?.issues || []) : validation.data?.issues || [],
-      warnings: usedAIPlan ? (aiPlanningResult.validation?.warnings || validation.data?.warnings || []) : validation.data?.warnings || [],
+      // Schema stores issues/warnings as strings; validator issues can be
+      // objects ({ type, day, providerId, message }) so reduce to text.
+      issues: ((usedAIPlan ? (aiPlanningResult.validation?.issues || validation.data?.issues || []) : validation.data?.issues || []) || []).map((i) => (typeof i === 'string' ? i : (i && (i.message || i.type)) || String(i))),
+      warnings: ((usedAIPlan ? (aiPlanningResult.validation?.warnings || validation.data?.warnings || []) : validation.data?.warnings || []) || []).map((w) => (typeof w === 'string' ? w : (w && (w.message || w.type)) || String(w))),
       validatedAt: new Date(),
       usedAIPlan,
       aiProvider: usedAIPlan ? aiProvider : null,

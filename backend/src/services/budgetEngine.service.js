@@ -91,28 +91,10 @@ export function calculateTripCost({
     }
   }
 
-  // Enhance transportation with real API price if available
-  const transportLive = transportResult?.data?.isLive === true;
-  const selectedTransport = transportResult?.data?.selected;
-  if (transportLive && selectedTransport?.price?.amount) {
-    // Override the sum of transport activities with the real API price
-    categories.transportation.amount = selectedTransport.price.amount;
-    categories.transportation.source = selectedTransport.provider || 'transport-api';
-    categories.transportation.sourceType = SOURCE_TYPES.API_LIVE;
-    categories.transportation.isLive = true;
-  }
-
-  // Enhance accommodation with real API price if available
-  const hotelLive = hotelResult?.data?.isLive === true;
-  const recommendedHotel = hotelResult?.data?.recommended;
-  if (hotelLive && recommendedHotel?.price?.amount && nights > 0) {
-    const hotelTotal = Math.round(recommendedHotel.price.amount * nights * rooms * 100) / 100;
-    categories.accommodation.amount = hotelTotal;
-    categories.accommodation.source = 'amadeus-hotels';
-    categories.accommodation.sourceType = SOURCE_TYPES.API_LIVE;
-    categories.accommodation.isLive = true;
-    categories.accommodation.pricePerNight = recommendedHotel.price.amount;
-  }
+  // NOTE: The live transport/hotel prices are already reflected in the day
+  // items themselves (arrival transport row, overnight rows), so no override
+  // is applied here — the category totals must exactly match the sum of the
+  // itinerary's displayed item prices.
 
   const total = Object.values(categories).reduce((sum, cat) => Math.round((sum + cat.amount) * 100) / 100, 0);
 
@@ -194,6 +176,7 @@ export function optimizeTransportation({
   transportAlloc,
   prefs,
   currency,
+  days = null,
 }) {
   const alternatives = transportResult?.data?.offers || [];
   const currentMode = transportResult?.mode || 'flight';
@@ -223,6 +206,21 @@ export function optimizeTransportation({
 
   if (saving <= 0) {
     return { replaced: false, change: null, newCost: currentCost };
+  }
+
+  // Apply the cheaper REAL transport offer to the itinerary's outbound row so
+  // the stored plan reflects the new live price.
+  if (days) {
+    for (const day of days) {
+      for (const act of day.activities || []) {
+        if (['flight', 'train', 'bus'].includes(act.category) || (act.category === 'transport' && String(act.slot || '') === 'transport' && !/local transport/i.test(String(act.title || '')))) {
+          act.cost.amount = newCost;
+          act.cost.isEstimate = false;
+          act.cost.estimateNote = 'Live price from provider';
+          act.cost.perPerson = null; // recomputed from the party size by finalizeDayCosts/normalize
+        }
+      }
+    }
   }
 
   return {
@@ -256,6 +254,7 @@ export function optimizeAccommodation({
   rooms,
   prefs,
   currency,
+  days = null,
 }) {
   const hotels = hotelResult?.data?.hotels || [];
   const currentHotel = hotelResult?.data?.recommended;
@@ -283,6 +282,38 @@ export function optimizeAccommodation({
     return { replaced: false, change: null, newCost: currentCost };
   }
 
+  // Apply the cheaper REAL hotel to the itinerary days so the stored plan
+  // itself reflects the reduced accommodation cost.
+  if (days) {
+    for (const day of days) {
+      for (const act of day.activities || []) {
+        if (act.category !== 'hotel') continue;
+        const title = String(act.title || '');
+        const charge = Math.round(newNightly * rooms * 100) / 100;
+        if (/check[\s-]*in/i.test(title)) {
+          act.cost.amount = 0;
+          act.cost.displayAmount = Math.round(newNightly * 100) / 100;
+          act.cost.displaySuffix = '/ room/night';
+          act.cost.isEstimate = false;
+          act.cost.estimateNote = 'Nightly rate — charged on the overnight entry';
+        } else if (!/check[\s-]*out/i.test(title)) {
+          act.cost.amount = charge;
+          act.cost.isEstimate = false;
+          act.cost.estimateNote = `Live price · ${newNightly}/room/night × ${rooms} room(s)`;
+          if (act.cost.perPerson != null && currentNightly > 0) {
+            act.cost.perPerson = Math.round((act.cost.perPerson * newNightly / currentNightly) * 100) / 100;
+          }
+        }
+      }
+      if (day.overnight) {
+        day.overnight.name = best.name || day.overnight.name;
+        day.overnight.pricePerRoomNight = Math.round(newNightly * 100) / 100;
+        day.overnight.total = Math.round(newNightly * (day.overnight.nights || 1) * rooms * 100) / 100;
+        day.overnight.isLive = true;
+      }
+    }
+  }
+
   return {
     replaced: true,
     change: {
@@ -303,84 +334,76 @@ export function optimizeAccommodation({
 // ══════════════════════════════════════════════════════════════════════
 
 /**
- * Replace expensive paid activities with free or cheaper real alternatives.
- * Works with the already-collected attraction data.
+ * Reduce ESTIMATED activity/attraction costs to fit the activities
+ * allocation. Never replaces a place with a "free alternative" — the system
+ * does not know those are free, and swapping would change the itinerary's
+ * places. Live/verified prices (e.g. Viator) are never touched.
  *
- * @returns {{ replaced: boolean, changes: Array, newCost: number }}
+ * @returns {{ replaced: boolean, change: object|null, newCost: number }}
  */
 export function optimizeActivities({
   days,
-  attractions,
   currentCost,
+  activityAlloc,
   partySize,
   currency,
 }) {
-  const changes = [];
-  let newCost = currentCost;
+  if (currentCost <= activityAlloc || activityAlloc <= 0) {
+    return { replaced: false, change: null, newCost: currentCost };
+  }
 
-  // Find paid activities sorted by cost (highest first)
-  const paidActivities = [];
+  // Only estimated (non-live) activities are reducible.
+  const reducible = [];
   for (const day of days || []) {
     for (const act of day.activities || []) {
-      if ((act.category === 'attraction' || act.category === 'activity') && (act.cost?.amount || 0) > 0) {
-        paidActivities.push({ day, act, amount: act.cost.amount });
+      if (
+        (act.category === 'attraction' || act.category === 'activity' || act.category === 'nightlife')
+        && (act.cost?.amount || 0) > 0
+        && act.cost.isEstimate !== false
+        && act.isLive !== true
+      ) {
+        reducible.push({ day, act, amount: act.cost.amount });
       }
     }
   }
-  paidActivities.sort((a, b) => b.amount - a.amount);
+  if (!reducible.length) {
+    return { replaced: false, change: null, newCost: currentCost };
+  }
 
-  // Find free attractions from collected data
-  const freeAttractions = (attractions || []).filter((a) => {
-    const name = String(a.name || '').toLowerCase();
-    // Parks, beaches, viewpoints, markets are typically free
-    return /park|beach|viewpoint|garden|market|promenade|square|waterfront|lake|river/.test(name + ' ' + (a.types || []).join(' '));
-  });
+  const reducibleTotal = reducible.reduce((s, r) => s + r.amount, 0);
+  if (reducibleTotal <= 0) {
+    return { replaced: false, change: null, newCost: currentCost };
+  }
 
-  // Replace expensive activities with free alternatives where possible
-  for (const paid of paidActivities) {
-    if (newCost <= 0) break;
-
-    // Find a free alternative that hasn't been used
-    const usedNames = new Set();
-    for (const d of days || []) {
-      for (const a of d.activities || []) {
-        usedNames.add(a.place?.toLowerCase() || a.title?.toLowerCase() || '');
-      }
+  const factor = Math.max(0.5, Math.min(1, (reducibleTotal - (currentCost - activityAlloc)) / reducibleTotal));
+  let saving = 0;
+  for (const r of reducible) {
+    const newAmount = Math.round(r.amount * factor * 100) / 100;
+    saving += r.amount - newAmount;
+    r.act.cost.amount = newAmount;
+    r.act.cost.isEstimate = true;
+    r.act.cost.estimateNote = 'Estimated activity cost reduced to fit the activities budget';
+    if (r.act.cost.perPerson != null) {
+      r.act.cost.perPerson = Math.round((newAmount / partySize) * 100) / 100;
     }
+  }
 
-    const freeAlt = freeAttractions.find((f) => !usedNames.has(f.name?.toLowerCase()));
-    if (!freeAlt) continue;
-
-    const saving = paid.amount;
-    if (saving <= 0) continue;
-
-    // Update the activity cost
-    paid.act.cost.amount = 0;
-    paid.act.cost.isEstimate = true;
-    paid.act.cost.estimateNote = 'Replaced with free alternative for budget optimization';
-    paid.act.place = freeAlt.name;
-    paid.act.title = freeAlt.name;
-    paid.act.description = `${freeAlt.types?.join(', ') || 'Free attraction'} — selected as budget-friendly alternative`;
-    paid.act.source = 'geoapify';
-    paid.act.isLive = true;
-    paid.act.dataStatus = 'live';
-
-    newCost = Math.round((newCost - saving) * 100) / 100;
-    changes.push({
-      category: 'activities',
-      from: `${paid.act.title || 'Activity'} (${paid.amount} ${currency})`,
-      to: `${freeAlt.name} (Free)`,
-      saving,
-      source: 'geoapify',
-      sourceType: SOURCE_TYPES.API_LIVE,
-      isLive: true,
-    });
+  if (saving <= 0) {
+    return { replaced: false, change: null, newCost: currentCost };
   }
 
   return {
-    replaced: changes.length > 0,
-    changes,
-    newCost,
+    replaced: true,
+    change: {
+      category: 'activities',
+      from: `Estimated activity cost (${currentCost} ${currency})`,
+      to: `Reduced to fit activities allocation (${Math.round((currentCost - saving) * 100) / 100} ${currency})`,
+      saving: Math.round(saving * 100) / 100,
+      source: 'budget-allocation',
+      sourceType: SOURCE_TYPES.BUDGET_ALLOCATION,
+      isLive: false,
+    },
+    newCost: Math.round((currentCost - saving) * 100) / 100,
   };
 }
 
@@ -389,35 +412,58 @@ export function optimizeActivities({
 // ══════════════════════════════════════════════════════════════════════
 
 /**
- * Optimize food costs by selecting restaurants with lower price levels.
- * Works with already-collected restaurant data.
+ * Reduce ESTIMATED meal (restaurant) costs to fit the food allocation.
+ * Applies the reduction directly to the itinerary days so the stored plan
+ * itself stays within budget. Live Zomato average costs are not touched.
  *
  * @returns {{ replaced: boolean, change: object|null, newCost: number }}
  */
 export function optimizeFood({
   days,
-  restaurants,
   currentCost,
   partySize,
   currency,
-  allocation,
+  foodAlloc,
 }) {
-  // Food costs are estimates based on price level. We can reduce by
-  // suggesting lower price-level restaurants, but we can't invent new prices.
-  // The best we can do is report the current estimate and suggest alternatives.
-
-  const foodAlloc = allocation?.food?.amount || currentCost;
-  const perDay = days?.length > 0 ? foodAlloc / days.length : 0;
-
-  // If current cost is already within food allocation, no optimization needed
-  if (currentCost <= foodAlloc) {
+  if (currentCost <= foodAlloc || foodAlloc <= 0) {
     return { replaced: false, change: null, newCost: currentCost };
   }
 
-  // Reduce food cost proportionally to fit within allocation
-  const ratio = foodAlloc / currentCost;
-  const newCost = Math.round(currentCost * ratio * 100) / 100;
-  const saving = Math.round((currentCost - newCost) * 100) / 100;
+  // Only estimated (non-live) meals are reducible.
+  const reducible = [];
+  for (const day of days || []) {
+    for (const act of day.activities || []) {
+      if (
+        act.category === 'restaurant'
+        && (act.cost?.amount || 0) > 0
+        && act.cost.isEstimate !== false
+        && act.isLive !== true
+      ) {
+        reducible.push({ day, act, amount: act.cost.amount });
+      }
+    }
+  }
+  if (!reducible.length) {
+    return { replaced: false, change: null, newCost: currentCost };
+  }
+
+  const reducibleTotal = reducible.reduce((s, r) => s + r.amount, 0);
+  if (reducibleTotal <= 0) {
+    return { replaced: false, change: null, newCost: currentCost };
+  }
+
+  const factor = Math.max(0.5, Math.min(1, (reducibleTotal - (currentCost - foodAlloc)) / reducibleTotal));
+  let saving = 0;
+  for (const r of reducible) {
+    const newAmount = Math.round(r.amount * factor * 100) / 100;
+    saving += r.amount - newAmount;
+    r.act.cost.amount = newAmount;
+    r.act.cost.isEstimate = true;
+    r.act.cost.estimateNote = 'Estimated meal cost reduced to fit the food budget';
+    if (r.act.cost.perPerson != null) {
+      r.act.cost.perPerson = Math.round((newAmount / partySize) * 100) / 100;
+    }
+  }
 
   if (saving <= 0) {
     return { replaced: false, change: null, newCost: currentCost };
@@ -428,13 +474,13 @@ export function optimizeFood({
     change: {
       category: 'food',
       from: `Estimated food cost (${currentCost} ${currency})`,
-      to: `Adjusted to food allocation (${newCost} ${currency})`,
-      saving,
+      to: `Reduced to fit food allocation (${Math.round((currentCost - saving) * 100) / 100} ${currency})`,
+      saving: Math.round(saving * 100) / 100,
       source: 'budget-allocation',
       sourceType: SOURCE_TYPES.BUDGET_ALLOCATION,
       isLive: false,
     },
-    newCost,
+    newCost: Math.round((currentCost - saving) * 100) / 100,
   };
 }
 
@@ -443,8 +489,9 @@ export function optimizeFood({
 // ══════════════════════════════════════════════════════════════════════
 
 /**
- * Optimize local transport costs. Can reduce by suggesting walking
- * for short distances or public transport for longer ones.
+ * Reduce ESTIMATED local transport costs to fit the local-transport share of
+ * the transport allocation. Applies the reduction to the day's local
+ * transport rows. Walking/free legs are never touched.
  *
  * @returns {{ replaced: boolean, change: object|null, newCost: number }}
  */
@@ -458,20 +505,52 @@ export function optimizeLocalTransport({
     return { replaced: false, change: null, newCost: currentCost };
   }
 
-  const newCost = localTransportAlloc;
-  const saving = Math.round((currentCost - newCost) * 100) / 100;
+  // Only estimated local-transport rows are reducible.
+  const reducible = [];
+  for (const day of days || []) {
+    for (const act of day.activities || []) {
+      if (
+        act.category === 'transport'
+        && /local transport|transfers/i.test(String(act.title || ''))
+        && (act.cost?.amount || 0) > 0
+        && act.cost.isEstimate !== false
+        && act.isLive !== true
+      ) {
+        reducible.push({ day, act, amount: act.cost.amount });
+      }
+    }
+  }
+  if (!reducible.length) {
+    return { replaced: false, change: null, newCost: currentCost };
+  }
+
+  const reducibleTotal = reducible.reduce((s, r) => s + r.amount, 0);
+  if (reducibleTotal <= 0) {
+    return { replaced: false, change: null, newCost: currentCost };
+  }
+
+  const factor = Math.max(0.5, Math.min(1, (reducibleTotal - (currentCost - localTransportAlloc)) / reducibleTotal));
+  let saving = 0;
+  for (const r of reducible) {
+    const newAmount = Math.round(r.amount * factor * 100) / 100;
+    saving += r.amount - newAmount;
+    r.act.cost.amount = newAmount;
+    r.act.cost.isEstimate = true;
+    r.act.cost.estimateNote = 'Estimated local transport reduced to fit the transport budget';
+  }
 
   if (saving <= 0) {
     return { replaced: false, change: null, newCost: currentCost };
   }
 
+  const newCost = Math.round((currentCost - saving) * 100) / 100;
   return {
     replaced: true,
     change: {
       category: 'localTransport',
       from: `Estimated local transport (${currentCost} ${currency})`,
-      to: `Adjusted to local transport allocation (${newCost} ${currency})`,
-      saving,
+      to: `Reduced to fit local transport allocation (${newCost} ${currency})`,
+      saving: Math.round(saving * 100) / 100,
       source: 'budget-allocation',
       sourceType: SOURCE_TYPES.BUDGET_ALLOCATION,
       isLive: false,
@@ -571,6 +650,7 @@ export function runOptimizationLoop(context) {
       transportAlloc: allocation?.transport?.amount || 0,
       prefs,
       currency,
+      days: currentDays,
     });
     if (transportOpt.replaced && transportOpt.change.saving > bestSaving) {
       bestSaving = transportOpt.change.saving;
@@ -586,6 +666,7 @@ export function runOptimizationLoop(context) {
       rooms,
       prefs,
       currency,
+      days: currentDays,
     });
     if (hotelOpt.replaced && hotelOpt.change.saving > bestSaving) {
       bestSaving = hotelOpt.change.saving;
@@ -596,28 +677,24 @@ export function runOptimizationLoop(context) {
     const activityCost = costResult.categories.activities.amount;
     const activityOpt = optimizeActivities({
       days: currentDays,
-      attractions,
       currentCost: activityCost,
+      activityAlloc: allocation?.activities?.amount || 0,
       partySize,
       currency,
     });
-    if (activityOpt.replaced) {
-      const totalActivitySaving = activityOpt.changes.reduce((sum, c) => sum + c.saving, 0);
-      if (totalActivitySaving > bestSaving) {
-        bestSaving = totalActivitySaving;
-        bestOptimization = { type: 'activities', result: activityOpt };
-      }
+    if (activityOpt.replaced && activityOpt.change.saving > bestSaving) {
+      bestSaving = activityOpt.change.saving;
+      bestOptimization = { type: 'activities', result: activityOpt };
     }
 
     // Step 4: Check food
     const foodCost = costResult.categories.food.amount;
     const foodOpt = optimizeFood({
       days: currentDays,
-      restaurants,
       currentCost: foodCost,
       partySize,
       currency,
-      allocation,
+      foodAlloc: allocation?.food?.amount || 0,
     });
     if (foodOpt.replaced && foodOpt.change.saving > bestSaving) {
       bestSaving = foodOpt.change.saving;
@@ -646,12 +723,7 @@ export function runOptimizationLoop(context) {
     }
 
     // Apply the best optimization
-    if (bestOptimization.type === 'activities') {
-      // Activities optimization may have multiple changes
-      allChanges.push(...bestOptimization.result.changes);
-    } else {
-      allChanges.push(bestOptimization.result.change);
-    }
+    allChanges.push(bestOptimization.result.change);
 
     logger.info(`[BUDGET_ENGINE] Applied ${bestOptimization.type} optimization — saving ${bestSaving} ${currency}`);
 

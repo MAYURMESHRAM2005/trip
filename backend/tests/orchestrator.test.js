@@ -201,7 +201,9 @@ test('buildDays picks distinct restaurants per day and scales cost by travellers
     weatherResult: { data: { provider: 'unavailable', forecast: null } },
     attractions: [],
     restaurants,
-    budgetAllocation: { transport: { amount: 5000 }, hotels: { amount: 9000 }, food: { amount: 6000 } },
+    // food ₹14000 over 3 days → ₹4667/day → ₹388/person/meal, so the ₹350/person
+    // priceLevel-1 lunch is not capped by the food envelope.
+    budgetAllocation: { transport: { amount: 5000 }, hotels: { amount: 9000 }, food: { amount: 14000 } },
     totalBudget: 50000,
     currency: 'INR',
   });

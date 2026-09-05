@@ -1,5 +1,7 @@
 import { haversineKm } from '../utils/geo.js';
 import budgetService from './budget.service.js';
+import pricingService from './pricing.service.js';
+import { getDestinationInfoSync, curatedPlaces, curatedPick } from './destination.service.js';
 
 /**
  * Deterministic schedule builder. Composes real provider data into a
@@ -26,8 +28,7 @@ import budgetService from './budget.service.js';
  * flags - nothing is ever invented.
  */
 
-const RESTAURANT_PRICE_BY_LEVEL = { 0: 150, 1: 350, 2: 700, 3: 1400, 4: 2500 };
-const ATTRACTION_ENTRY_DEFAULT = { amount: 0, isEstimate: true };
+const RESTAURANT_PRICE_BY_LEVEL = pricingService.MEAL_PRICE_TIERS;
 /**
  * The current date for freshness checks.
  */
@@ -218,84 +219,7 @@ function validateNoDuplicateAttractions(days) {
 /*  Cost math (deterministic, traveller-aware)                         */
 /* ------------------------------------------------------------------ */
 
-function restaurantMealCost(r, meal, partySize, currency) {
-  const cur = currency || 'INR';
-
-  // Use Zomato real average cost when available (not an estimate)
-  if (r.zomatoData && r.zomatoData.averageCostPerPerson > 0) {
-    let perPerson = r.zomatoData.averageCostPerPerson;
-    // Adjust per meal type: breakfast ~60%, lunch ~85%, dinner ~115% of average
-    if (meal === 'breakfast') perPerson = Math.max(80, Math.round(perPerson * 0.6));
-    else if (meal === 'lunch') perPerson = Math.round(perPerson * 0.85);
-    else if (meal === 'dinner') perPerson = Math.round(perPerson * 1.15);
-    const amount = Math.round(perPerson * partySize * 100) / 100;
-    return {
-      amount,
-      perPerson,
-      currency: cur,
-      isEstimate: false,
-      estimateNote: `Real average cost from Zomato (${meal}) × ${partySize} traveller(s) — ${r.zomatoData.ratingText || 'rated'} ${r.zomatoData.rating ?? ''} (${r.zomatoData.votes ?? 0} votes)`,
-      source: 'zomato',
-      fetchedAt: r.zomatoData.fetchedAt || NOW_ISO,
-    };
-  }
-
-  // Fallback: Geoapify priceLevel estimate (always marked as estimate)
-  const base = RESTAURANT_PRICE_BY_LEVEL[r.priceLevel ?? 1] ?? 350;
-  let perPerson = base;
-  if (meal === 'breakfast') perPerson = Math.max(80, Math.round(base * 0.6));
-  if (meal === 'dinner') perPerson = Math.round(base * 1.15);
-  const amount = Math.round(perPerson * partySize * 100) / 100;
-  return {
-    amount,
-    perPerson,
-    currency: cur,
-    isEstimate: true,
-    estimateNote: `Estimated ~${cur} ${perPerson}/person × ${partySize} traveller(s) based on restaurant price level ${r.priceLevel ?? 'unknown'}. Actual menu prices not available from provider.`,
-    source: 'geoapify-pricelevel-estimate',
-    fetchedAt: NOW_ISO,
-  };
-}
-
-function entryFeeEstimateFor(attraction) {
-  // Geoapify does not provide entry fee data. All fees are estimates
-  // based on attraction type. Never present these as real API prices.
-  const name = String(attraction?.name || '').toLowerCase();
-  const types = (attraction?.types || []).join(' ').toLowerCase();
-  if (/museum|gallery|monument|fort|palace|temple|church|mosque|zoo|park|garden|waterfall/.test(name + ' ' + types)) {
-    return { amount: 200, isEstimate: true, estimateNote: 'Estimated typical entry fee - no live pricing available from provider. Confirm locally.' };
-  }
-  return { amount: 0, isEstimate: true, estimateNote: 'Entry fee unknown - no live pricing available from provider. Confirm locally.' };
-}
-
-function attractionCost(a, currency, partySize) {
-  // Use Viator real pricing when available (not an estimate)
-  if (a.entryFee && typeof a.entryFee.amount === 'number' && a.entryFee.amount > 0) {
-    const perPerson = a.entryFee.amount;
-    const cur = a.entryFee.currency || currency || 'INR';
-    return {
-      amount: Math.round(perPerson * partySize * 100) / 100,
-      perPerson,
-      currency: cur,
-      isEstimate: false,
-      estimateNote: `Real price from Viator (${a.entryFee.productTitle || a.entryFee.source}) × ${partySize} traveller(s)`,
-      source: 'viator',
-      fetchedAt: a.entryFee.fetchedAt || NOW_ISO,
-    };
-  }
-  // Fallback to estimate when no Viator data is available
-  const fee = entryFeeEstimateFor(a);
-  const perPerson = fee.amount;
-  return {
-    amount: Math.round(perPerson * partySize * 100) / 100,
-    perPerson,
-    currency,
-    isEstimate: true,
-    estimateNote: perPerson ? `${fee.estimateNote} × ${partySize} traveller(s)` : fee.estimateNote,
-    source: 'estimate',
-    fetchedAt: NOW_ISO,
-  };
-}
+const { restaurantMealCost, entryFeeEstimateFor, attractionCost } = pricingService;
 
 /**
  * Look up a cached real route between two coordinate pairs.
@@ -489,12 +413,16 @@ function pickDistinct(pool, usedKeys, n, label) {
 }
 
 /** Pick the cheapest hotel that fits the per-room-night budget envelope. */
-function fitHotelToBudget(hotelResult, perRoomNight, nights, rooms) {
+function fitHotelToBudget(hotelResult, perRoomNight, nights, rooms, destInfo) {
   const data = hotelResult?.data || {};
   const list = Array.isArray(data.hotels) ? data.hotels : [];
   const recommended = data.recommended || null;
+  // Without an explicit accommodation allocation, use a modest default
+  // per-room-night so the hotel choice is still budget-capped (never picks
+  // an arbitrarily expensive hotel just because live data returned one).
+  const effectivePerRoomNight = perRoomNight > 0 ? perRoomNight : 1800;
   const budgeted = perRoomNight > 0;
-  const within = (h) => !budgeted || h.price?.amount == null || h.price.amount <= perRoomNight * 1.05;
+  const within = (h) => h.price?.amount == null || h.price.amount <= effectivePerRoomNight * 1.05;
 
   const candidates = list.filter((h) => h.name && within(h));
   const ordered = [...candidates].sort((a, b) => (a.price?.amount ?? Infinity) - (b.price?.amount ?? Infinity));
@@ -507,15 +435,33 @@ function fitHotelToBudget(hotelResult, perRoomNight, nights, rooms) {
       hotel: chosen,
       nightly,
       total,
-      isLive: data.isLive === true && chosen.price?.amount != null,
+      isLive: data.isLive === true && chosen.price?.amount != null && chosen.source !== 'curated',
       notes: budgeted && nightly > perRoomNight ? `Hotel rate capped to fit the accommodation budget.` : '',
     };
   }
-  // No live hotel fits -> honest budget estimate (never an invented hotel).
+  // No live/curated hotel fits → destination-specific curated hotel fallback.
+  if (destInfo) {
+    const curated = curatedPlaces(destInfo, 'hotels');
+    const withinCurated = curated.filter((h) => !budgeted || h.pricePerNight <= effectivePerRoomNight * 1.15);
+    const pool = withinCurated.length ? withinCurated : curated;
+    const best = [...pool].sort((a, b) => a.pricePerNight - b.pricePerNight)[0];
+    if (best) {
+      const nightly = best.pricePerNight || effectivePerRoomNight;
+      const total = Math.round(nightly * nights * rooms * 100) / 100;
+      return {
+        hotel: { ...best, price: { amount: nightly, currency: 'INR' } },
+        nightly,
+        total,
+        isLive: false,
+        notes: `Curated destination hotel — estimated ${nightly}/room/night based on hotel category.`,
+      };
+    }
+  }
+  // Last resort: honest budget estimate (never an invented hotel).
   return {
     hotel: null,
-    nightly: perRoomNight,
-    total: Math.round(perRoomNight * nights * rooms * 100) / 100,
+    nightly: effectivePerRoomNight,
+    total: Math.round(effectivePerRoomNight * nights * rooms * 100) / 100,
     isLive: false,
     notes: 'Live hotel data unavailable or out of budget - nightly rate estimated from accommodation allocation.',
   };
@@ -549,6 +495,7 @@ export function buildDaysPlan({
   budgetAllocation,
   totalBudget,
   currency = 'INR',
+  destinationInfo,
 }) {
   const dates = dateRange(startDate, endDate);
   const allocation = budgetAllocation || {};
@@ -558,7 +505,42 @@ export function buildDaysPlan({
   const nights = Math.max(0, dates.length - 1);
   const daily = budgetService.planDailyBudgets({ allocation, daysCount: dates.length, nights, rooms });
 
-  const hotelPlan = fitHotelToBudget(hotelResult, daily.perDay.hotelPerRoomNight, nights, rooms);
+  // Per-person budget caps applied to ESTIMATED prices only: meals share the
+  // daily food envelope, activities share the daily activities envelope.
+  // Live/verified prices are never capped.
+  const mealPerPersonCap = Math.round((daily.perDay.food / 3 / partySize) * 100) / 100;
+  const activityPerPersonCap = Math.round((daily.perDay.activities / partySize) * 100) / 100;
+
+  // Structured destination info (sync curated lookup — no network) + curated
+  // destination-specific places that fill any gaps in live provider data.
+  const destInfo = destinationInfo || getDestinationInfoSync(destination);
+  const curatedAttractions = curatedPlaces(destInfo, 'attractions');
+  const curatedRestaurants = [...curatedPlaces(destInfo, 'restaurants'), ...curatedPlaces(destInfo, 'cafes')];
+
+  // Merge live provider data first, curated fills gaps (dedupe by name).
+  const mergePools = (live, curated) => {
+    const merged = Array.isArray(live) ? live.slice() : [];
+    const seen = new Set(merged.map((x) => String(x?.name || '').toLowerCase()).filter(Boolean));
+    for (const c of curated || []) {
+      if (seen.has(String(c.name || '').toLowerCase())) continue;
+      merged.push(c);
+      seen.add(String(c.name || '').toLowerCase());
+    }
+    return merged;
+  };
+
+  // Honest status flags derived from the picked item — curated picks are
+  // NEVER labelled live, live picks are NEVER mislabelled as estimates.
+  const flagsFor = (p) => {
+    const curated = p?.source === 'curated';
+    return {
+      source: curated ? 'curated' : p?.source || 'geoapify',
+      isLive: curated ? false : p?.isLive === true,
+      dataStatus: curated ? 'estimate' : p?.isLive === true ? 'live' : 'estimate',
+    };
+  };
+
+  const hotelPlan = fitHotelToBudget(hotelResult, daily.perDay.hotelPerRoomNight, nights, rooms, destInfo);
   const hotel = hotelPlan.hotel;
   const hotelNightly = hotelPlan.nightly;
 
@@ -577,8 +559,8 @@ export function buildDaysPlan({
   const areaForDay = (idx) => areas[idx % Math.max(1, areas.length)];
   const areaRepeat = areas.length < dates.length;
 
-  const attractionsPool = attractions?.slice() || [];
-  const restaurantsPool = restaurants?.slice() || [];
+  const attractionsPool = mergePools(attractions, curatedAttractions);
+  const restaurantsPool = mergePools(restaurants, curatedRestaurants);
   const nightlifePool = nightlife?.slice() || [];
   const usedAttractions = new Set();
   const usedRestaurants = new Set();
@@ -678,7 +660,7 @@ export function buildDaysPlan({
 
     // Shared factory for a real place activity.
     // Every activity includes fetchedAt for data source transparency.
-    const placeActivity = ({ time, title, place, description, category, address, coordinates, cost, source, isLive, dataStatus, priority, slot, bookingUrl = '', travel }) => ({
+    const placeActivity = ({ time, title, place, description, category, address, coordinates, cost, source, isLive, dataStatus, priority, slot, bookingUrl = '', travel, types, entryFee }) => ({
       time,
       slot,
       title,
@@ -687,6 +669,10 @@ export function buildDaysPlan({
       category,
       address: address || '',
       coordinates: coordinates || null,
+      // Preserve the provider's type + entry-fee data so later pricing passes
+      // can tell a confirmed-free attraction apart from an unpriced one.
+      types: Array.isArray(types) ? types : null,
+      entryFee: entryFee || null,
       cost: { ...cost },
       source: source || (isLive ? 'provider' : 'estimate'),
       bookingUrl,
@@ -735,18 +721,36 @@ export function buildDaysPlan({
           category: 'hotel',
           address: hotel.address || '',
           coordinates: hotel.latitude != null ? { lat: Number(hotel.latitude), lng: Number(hotel.longitude) } : null,
-          cost: { amount: 0, currency: hotel?.price?.currency || currency, isEstimate: true, estimateNote: 'Rate charged on the overnight entry' },
+          cost: {
+            amount: 0,
+            currency: hotel?.price?.currency || currency,
+            isEstimate: true,
+            perPerson: 0,
+            // Display-only nightly rate on check-in; the overnight row below
+            // carries the actual charge so day totals never double-count.
+            displayAmount: Math.round(hotelNightly * 100) / 100,
+            displaySuffix: '/ room/night',
+            estimateNote: 'Nightly rate — charged on the overnight entry',
+          },
           source: hotelPlan.isLive ? 'amadeus-hotels' : 'budget-estimate', isLive: hotelPlan.isLive,
           dataStatus: hotelPlan.isLive ? 'live' : 'estimate', priority: 1,
         }));
       } else {
         activities.push(placeActivity({
           time: '12:00', slot: 'hotel',
-          title: `Check-in · Accommodation in ${destination}`,
+          title: `Check-in · Estimated accommodation in ${destination}`,
           place: destination,
-          description: `Live hotel data unavailable or out of budget. Estimated nightly rate allocated from budget (${hotelNightly}/room/night × ${rooms} room(s)).`,
+          description: `Estimated nightly rate allocated from budget (${hotelNightly}/room/night × ${rooms} room(s)) — best local hotel selected on arrival.`,
           category: 'hotel',
-          cost: { amount: 0, currency, isEstimate: true, estimateNote: 'Rate charged on the overnight entry' },
+          cost: {
+            amount: 0,
+            currency,
+            isEstimate: true,
+            perPerson: 0,
+            displayAmount: Math.round(hotelNightly * 100) / 100,
+            displaySuffix: '/ room/night',
+            estimateNote: 'Nightly rate — charged on the overnight entry',
+          },
           source: 'budget-estimate', isLive: false, dataStatus: 'estimate', priority: 1,
         }));
       }
@@ -763,19 +767,32 @@ export function buildDaysPlan({
           place: r.name,
           description: `Start the day right - rating ${r.rating ?? 'n/a'}.${reuseNote(breakfast) ? ` ${reuseNote(breakfast)}` : ''}`,
           category: 'restaurant', address: r.address || '', coordinates: r.coordinates || null,
-          cost: restaurantMealCost(r, 'breakfast', partySize, currency),
-          source: 'geoapify', isLive: true, dataStatus: 'live', priority: 2,
+          cost: restaurantMealCost(r, 'breakfast', partySize, currency, mealPerPersonCap),
+          ...flagsFor(r), priority: 2,
         }));
       } else {
-        activities.push(placeActivity({
-          time: '08:00', slot: 'breakfast',
-          title: 'Breakfast',
-          place: destination,
-          description: 'Breakfast recommendation pending - live data unavailable.',
-          category: 'restaurant',
-          cost: { amount: Math.round((daily.perDay.food / 3) * 100) / 100, currency, isEstimate: true, estimateNote: 'Estimated from food budget', source: 'budget-estimate', fetchedAt: NOW_ISO },
-          source: 'budget-estimate', isLive: false, dataStatus: 'unavailable', priority: 2,
-        }));
+        const curatedMeal = curatedPick(destInfo, 'restaurants', { exclude: usedRestaurants });
+        if (curatedMeal) {
+          activities.push(placeActivity({
+            time: '08:00', slot: 'breakfast',
+            title: `Breakfast at ${curatedMeal.name}`,
+            place: curatedMeal.name,
+            description: `Start the day right — ${curatedMeal.cuisines?.join(', ') || 'local breakfast spot'} in ${destination}. Curated recommendation.`,
+            category: 'restaurant', address: curatedMeal.address || '', coordinates: curatedMeal.coordinates || null,
+            cost: restaurantMealCost(curatedMeal, 'breakfast', partySize, currency, mealPerPersonCap),
+            source: 'curated', isLive: false, dataStatus: 'estimate', priority: 2,
+          }));
+        } else {
+          activities.push(placeActivity({
+            time: '08:00', slot: 'breakfast',
+            title: `Breakfast in ${destination}`,
+            place: destination,
+            description: 'Estimated breakfast at a local eatery — budget allocated from the food plan.',
+            category: 'restaurant',
+            cost: { amount: Math.round((daily.perDay.food / 3) * 100) / 100, currency, isEstimate: true, estimateNote: 'Estimated from food budget', source: 'budget-estimate', fetchedAt: NOW_ISO },
+            source: 'budget-estimate', isLive: false, dataStatus: 'estimate', priority: 2,
+          }));
+        }
       }
 
       // Morning activity (indoor swap when heavy rain is forecast)
@@ -798,19 +815,35 @@ export function buildDaysPlan({
           place: pick.name,
           description: `${pick.types?.join(', ') || 'Tourist attraction'}${badWeather && isIndoorPicked ? ' · Indoor plan - rain expected.' : isIndoorPicked ? '' : badWeather ? ' · Consider an indoor alternative if it rains.' : ''}`,
           category: 'attraction', address: pick.address || '', coordinates: pick.coordinates || null,
-          cost: attractionCost(pick, currency, partySize),
-          source: 'geoapify', isLive: true, dataStatus: 'live', priority: 1,
+          cost: attractionCost(pick, currency, partySize, activityPerPersonCap),
+          ...flagsFor(pick), priority: 1,
         }));
       } else {
-        activities.push(placeActivity({
-          time: '09:30', slot: 'morning',
-          title: `Explore ${destination}`,
-          place: destination,
-          description: 'Self-guided exploration. Attraction data unavailable - check the Maps & Places pages.',
-          category: 'attraction',
-          cost: { amount: 0, currency, isEstimate: true, estimateNote: 'Free / unknown entry fee' },
-          source: 'none', isLive: false, dataStatus: 'unavailable', priority: 3,
-        }));
+        const curatedAct = curatedPick(destInfo, 'attractions', { exclude: usedAttractions });
+        if (curatedAct) {
+          activities.push(placeActivity({
+            time: '09:30', slot: 'morning',
+            title: curatedAct.name,
+            place: curatedAct.name,
+            description: `${curatedAct.attractionCategory || 'Tourist attraction'} in ${destination} — curated recommendation.`,
+            category: 'attraction', address: curatedAct.address || '', coordinates: curatedAct.coordinates || null,
+            cost: attractionCost(curatedAct, currency, partySize, activityPerPersonCap),
+            source: 'curated', isLive: false, dataStatus: 'estimate', priority: 1,
+          }));
+        } else {
+          // Unknown attraction: give a small entry estimate rather than Free,
+          // because the backend does not actually know whether entry is free.
+          const entryFee = entryFeeEstimateFor({ name: destination, types: ['attraction'] });
+          activities.push(placeActivity({
+            time: '09:30', slot: 'morning',
+            title: `Explore ${destination}`,
+            place: destination,
+            description: 'Self-guided exploration of the destination’s main sights.',
+            category: 'attraction',
+            cost: { amount: entryFee.amount, currency, isEstimate: true, estimateNote: entryFee.estimateNote },
+            source: 'budget-estimate', isLive: false, dataStatus: 'estimate', priority: 3,
+          }));
+        }
       }
 
       // Lunch (near the morning activity's area)
@@ -822,19 +855,32 @@ export function buildDaysPlan({
           place: r.name,
           description: `Cuisine match for ${prefs?.foodPreference || 'your preference'}. Rating ${r.rating ?? 'n/a'}.${reuseNote(lunch) ? ` ${reuseNote(lunch)}` : ''}`,
           category: 'restaurant', address: r.address || '', coordinates: r.coordinates || null,
-          cost: restaurantMealCost(r, 'lunch', partySize, currency),
-          source: 'geoapify', isLive: true, dataStatus: 'live', priority: 1,
+          cost: restaurantMealCost(r, 'lunch', partySize, currency, mealPerPersonCap),
+          ...flagsFor(r), priority: 1,
         }));
       } else {
-        activities.push(placeActivity({
-          time: '13:00', slot: 'lunch',
-          title: 'Lunch',
-          place: destination,
-          description: 'Restaurant recommendation pending - live data unavailable. Use the Restaurants page when online.',
-          category: 'restaurant',
-          cost: { amount: Math.round((daily.perDay.food / 3) * 100) / 100, currency, isEstimate: true, estimateNote: 'Estimated from food budget', source: 'budget-estimate', fetchedAt: NOW_ISO },
-          source: 'budget-estimate', isLive: false, dataStatus: 'unavailable', priority: 2,
-        }));
+        const curatedMeal = curatedPick(destInfo, 'restaurants', { exclude: usedRestaurants });
+        if (curatedMeal) {
+          activities.push(placeActivity({
+            time: '13:00', slot: 'lunch',
+            title: `Lunch at ${curatedMeal.name}`,
+            place: curatedMeal.name,
+            description: `${curatedMeal.cuisines?.join(', ') || 'Local cuisine'} in ${destination} — curated recommendation.`,
+            category: 'restaurant', address: curatedMeal.address || '', coordinates: curatedMeal.coordinates || null,
+            cost: restaurantMealCost(curatedMeal, 'lunch', partySize, currency, mealPerPersonCap),
+            source: 'curated', isLive: false, dataStatus: 'estimate', priority: 1,
+          }));
+        } else {
+          activities.push(placeActivity({
+            time: '13:00', slot: 'lunch',
+            title: `Lunch in ${destination}`,
+            place: destination,
+            description: 'Estimated lunch at a local restaurant — budget allocated from the food plan.',
+            category: 'restaurant',
+            cost: { amount: Math.round((daily.perDay.food / 3) * 100) / 100, currency, isEstimate: true, estimateNote: 'Estimated from food budget', source: 'budget-estimate', fetchedAt: NOW_ISO },
+            source: 'budget-estimate', isLive: false, dataStatus: 'estimate', priority: 2,
+          }));
+        }
       }
 
       // Afternoon activity (indoor swap when heavy rain is forecast)
@@ -856,19 +902,32 @@ export function buildDaysPlan({
           place: a.name,
           description: `${a.types?.join(', ') || 'Afternoon activity'}${badWeather && indoorSwap ? ' · Indoor plan - rain expected.' : badWeather ? ' · Consider an indoor alternative if it rains.' : ''}`,
           category: 'attraction', address: a.address || '', coordinates: a.coordinates || null,
-          cost: attractionCost(a, currency, partySize),
-          source: 'geoapify', isLive: true, dataStatus: 'live', priority: 1,
+          cost: attractionCost(a, currency, partySize, activityPerPersonCap),
+          ...flagsFor(a), priority: 1,
         }));
       } else {
-        activities.push(placeActivity({
-          time: '14:30', slot: 'afternoon',
-          title: `Leisure time in ${destination}`,
-          place: destination,
-          description: 'Free time / self-guided exploration - live attraction data unavailable.',
-          category: 'activity',
-          cost: { amount: 0, currency, isEstimate: true, estimateNote: 'Free' },
-          source: 'none', isLive: false, dataStatus: 'unavailable', priority: 3,
-        }));
+        const curatedAct = curatedPick(destInfo, 'attractions', { exclude: usedAttractions });
+        if (curatedAct) {
+          activities.push(placeActivity({
+            time: '14:30', slot: 'afternoon',
+            title: curatedAct.name,
+            place: curatedAct.name,
+            description: `${curatedAct.attractionCategory || 'Afternoon activity'} in ${destination} — curated recommendation.`,
+            category: 'attraction', address: curatedAct.address || '', coordinates: curatedAct.coordinates || null,
+            cost: attractionCost(curatedAct, currency, partySize, activityPerPersonCap),
+            source: 'curated', isLive: false, dataStatus: 'estimate', priority: 1,
+          }));
+        } else {
+          activities.push(placeActivity({
+            time: '14:30', slot: 'afternoon',
+            title: `Leisure time in ${destination}`,
+            place: destination,
+            description: 'Free time / self-guided exploration of local sights.',
+            category: 'activity',
+            cost: { amount: 0, currency, isEstimate: true, estimateNote: 'Free' },
+            source: 'budget-estimate', isLive: false, dataStatus: 'estimate', priority: 3,
+          }));
+        }
       }
 
       // Evening (sunset / viewpoint / beach / market)
@@ -880,19 +939,32 @@ export function buildDaysPlan({
           place: e.name,
           description: `${e.types?.join(', ') || 'Evening activity'} - sunset / local evening.${badWeather ? ' Rain expected - keep an umbrella or move indoors.' : ''}`,
           category: 'activity', address: e.address || '', coordinates: e.coordinates || null,
-          cost: attractionCost(e, currency, partySize),
-          source: 'geoapify', isLive: true, dataStatus: 'live', priority: 2,
+          cost: attractionCost(e, currency, partySize, activityPerPersonCap),
+          ...flagsFor(e), priority: 2,
         }));
       } else {
-        activities.push(placeActivity({
-          time: '17:30', slot: 'evening',
-          title: `Local evening in ${destination}`,
-          place: destination,
-          description: 'Markets, waterfront or local culture. Details depend on live data availability.',
-          category: 'activity',
-          cost: { amount: 0, currency, isEstimate: true },
-          source: 'none', isLive: false, dataStatus: 'unavailable', priority: 3,
-        }));
+        const curatedAct = curatedPick(destInfo, 'attractions', { exclude: usedAttractions });
+        if (curatedAct) {
+          activities.push(placeActivity({
+            time: '17:30', slot: 'evening',
+            title: `${curatedAct.name} (evening)`,
+            place: curatedAct.name,
+            description: `${curatedAct.attractionCategory || 'Local evening activity'} — sunset / local evening in ${destination}. Curated recommendation.`,
+            category: 'activity', address: curatedAct.address || '', coordinates: curatedAct.coordinates || null,
+            cost: attractionCost(curatedAct, currency, partySize, activityPerPersonCap),
+            source: 'curated', isLive: false, dataStatus: 'estimate', priority: 2,
+          }));
+        } else {
+          activities.push(placeActivity({
+            time: '17:30', slot: 'evening',
+            title: `Local evening in ${destination}`,
+            place: destination,
+            description: 'Markets, waterfront or local culture — estimated local evening plan.',
+            category: 'activity',
+            cost: { amount: 80, currency, isEstimate: true, estimateNote: 'Estimated local evening spend' },
+            source: 'budget-estimate', isLive: false, dataStatus: 'estimate', priority: 3,
+          }));
+        }
       }
 
       // Dinner (near evening activity / accommodation)
@@ -904,19 +976,32 @@ export function buildDaysPlan({
           place: r.name,
           description: `Rating ${r.rating ?? 'n/a'}. ${prefs?.foodPreference ? `Matches ${prefs.foodPreference} preference.` : ''}${reuseNote(dinner) ? ` ${reuseNote(dinner)}` : ''}`,
           category: 'restaurant', address: r.address || '', coordinates: r.coordinates || null,
-          cost: restaurantMealCost(r, 'dinner', partySize, currency),
-          source: 'geoapify', isLive: true, dataStatus: 'live', priority: 1,
+          cost: restaurantMealCost(r, 'dinner', partySize, currency, mealPerPersonCap),
+          ...flagsFor(r), priority: 1,
         }));
       } else {
-        activities.push(placeActivity({
-          time: '20:00', slot: 'dinner',
-          title: 'Dinner',
-          place: destination,
-          description: 'Dinner recommendation pending - live data unavailable.',
-          category: 'restaurant',
-          cost: { amount: Math.round((daily.perDay.food / 3) * 100) / 100, currency, isEstimate: true, estimateNote: 'Estimated from food budget', source: 'budget-estimate', fetchedAt: NOW_ISO },
-          source: 'budget-estimate', isLive: false, dataStatus: 'unavailable', priority: 2,
-        }));
+        const curatedMeal = curatedPick(destInfo, 'restaurants', { exclude: usedRestaurants });
+        if (curatedMeal) {
+          activities.push(placeActivity({
+            time: '20:00', slot: 'dinner',
+            title: `Dinner at ${curatedMeal.name}`,
+            place: curatedMeal.name,
+            description: `${curatedMeal.cuisines?.join(', ') || 'Local cuisine'} in ${destination} — curated recommendation.`,
+            category: 'restaurant', address: curatedMeal.address || '', coordinates: curatedMeal.coordinates || null,
+            cost: restaurantMealCost(curatedMeal, 'dinner', partySize, currency, mealPerPersonCap),
+            source: 'curated', isLive: false, dataStatus: 'estimate', priority: 1,
+          }));
+        } else {
+          activities.push(placeActivity({
+            time: '20:00', slot: 'dinner',
+            title: `Dinner in ${destination}`,
+            place: destination,
+            description: 'Estimated dinner at a local restaurant — budget allocated from the food plan.',
+            category: 'restaurant',
+            cost: { amount: Math.round((daily.perDay.food / 3) * 100) / 100, currency, isEstimate: true, estimateNote: 'Estimated from food budget', source: 'budget-estimate', fetchedAt: NOW_ISO },
+            source: 'budget-estimate', isLive: false, dataStatus: 'estimate', priority: 2,
+          }));
+        }
       }
 
       // Night / optional local activity (real nightlife when available)
@@ -927,10 +1012,10 @@ export function buildDaysPlan({
           time: '21:30', slot: 'night',
           title: `Local evening pick: ${n.name}`,
           place: n.name,
-          description: `${n.types?.join(', ') || 'Night market, live music or local entertainment'} (nightlife live data unavailable - local attraction used)`,
+          description: `${n.types?.join(', ') || 'Night market, live music or local entertainment'} (local attraction used for the evening)`,
           category: 'activity', address: n.address || '', coordinates: n.coordinates || null,
-          cost: attractionCost(n, currency, partySize),
-          source: 'geoapify', isLive: true, dataStatus: 'live', priority: 3,
+          cost: attractionCost(n, currency, partySize, activityPerPersonCap),
+          ...flagsFor(n), priority: 3,
         }));
       } else if (nightPick.picks[0]) {
         const n = nightPick.picks[0];
@@ -940,35 +1025,63 @@ export function buildDaysPlan({
           place: n.name,
           description: `${n.types?.join(', ') || 'Night market, live music or local entertainment'}${badWeather ? ' · Weather may affect open-air venues.' : ''}`,
           category: 'activity', address: n.address || '', coordinates: n.coordinates || null,
-          cost: attractionCost(n, currency, partySize),
-          source: 'geoapify', isLive: true, dataStatus: 'live', priority: 3,
+          cost: attractionCost(n, currency, partySize, activityPerPersonCap),
+          ...flagsFor(n), priority: 3,
         }));
       } else {
-        activities.push(placeActivity({
-          time: '21:30', slot: 'night',
-          title: `Local night life near ${area.name}`,
-          place: destination,
-          description: 'Evening market, night view or local entertainment - live data unavailable, confirm locally.',
-          category: 'activity',
-          cost: { amount: 0, currency, isEstimate: true, estimateNote: 'Free / varies' },
-          source: 'none', isLive: false, dataStatus: 'unavailable', priority: 3,
-        }));
+        const curatedNight = curatedPick(destInfo, 'nightlife', { exclude: usedNightlife }) || curatedPick(destInfo, 'cafes', { exclude: usedNightlife });
+        if (curatedNight) {
+          activities.push(placeActivity({
+            time: '21:30', slot: 'night',
+            title: `Night out: ${curatedNight.name}`,
+            place: curatedNight.name,
+            description: `${curatedNight.cuisines?.join(', ') || 'Night market, live music or local entertainment'} in ${destination} — curated recommendation.`,
+            category: 'activity', address: curatedNight.address || '', coordinates: curatedNight.coordinates || null,
+            cost: attractionCost(curatedNight, currency, partySize, activityPerPersonCap),
+            source: 'curated', isLive: false, dataStatus: 'estimate', priority: 3,
+          }));
+        } else {
+          const curatedAct = curatedPick(destInfo, 'attractions', { exclude: usedAttractions });
+          if (curatedAct) {
+            activities.push(placeActivity({
+              time: '21:30', slot: 'night',
+              title: `Local evening pick: ${curatedAct.name}`,
+              place: curatedAct.name,
+              description: `${curatedAct.attractionCategory || 'Local evening activity'} — evening option in ${destination}. Curated recommendation.`,
+              category: 'activity', address: curatedAct.address || '', coordinates: curatedAct.coordinates || null,
+              cost: attractionCost(curatedAct, currency, partySize, activityPerPersonCap),
+              source: 'curated', isLive: false, dataStatus: 'estimate', priority: 3,
+            }));
+          } else {
+            activities.push(placeActivity({
+              time: '21:30', slot: 'night',
+              title: `Local night life near ${area.name}`,
+              place: destination,
+              description: 'Evening market, night view or local entertainment — estimated plan, confirm locally.',
+              category: 'activity',
+              cost: { amount: 120, currency, isEstimate: true, estimateNote: 'Estimated night activity spend' },
+              source: 'budget-estimate', isLive: false, dataStatus: 'estimate', priority: 3,
+            }));
+          }
+        }
       }
 
-      // Local transport estimate (intra-day hops)
-      if (localTransportPerDay > 0) {
-        activities.push(placeActivity({
-          time: '19:15', slot: 'transport',
-          title: 'Local transport & transfers',
-          place: `${area.name}, ${destination}`,
-          description: 'Estimated local fares for intra-day movement (walking/taxi/bus).',
-          category: 'transport',
-          cost: { amount: localTransportPerDay, currency, isEstimate: true, estimateNote: 'Estimated from transport budget' },
-          source: 'budget-estimate', isLive: false, dataStatus: 'estimate', priority: 2,
-        }));
-      }
+      // Local transport estimate (intra-day hops) — always present on a full
+      // day; the cost is derived from the day's actual travel legs below.
+      activities.push(placeActivity({
+        time: '19:15', slot: 'transport',
+        title: 'Local transport & transfers',
+        place: `${area.name}, ${destination}`,
+        description: 'Estimated local fares for intra-day movement (walking/taxi/bus).',
+        category: 'transport',
+        cost: { amount: 0, currency, isEstimate: true, estimateNote: 'Estimated from intra-day travel legs', source: 'budget-estimate', fetchedAt: NOW_ISO },
+        source: 'budget-estimate', isLive: false, dataStatus: 'estimate', priority: 2,
+      }));
 
-      // Overnight at hotel (charge per night, per room)
+      // Overnight at hotel (charge per night, per room).
+      // One night per day, charged once. The nightly rate is already budget-aware
+      // because hotelPlan.nightly was derived from the accommodation allocation.
+      const overnightAmount = Math.round(hotelNightly * rooms * 100) / 100;
       activities.push(placeActivity({
         time: '22:30', slot: 'hotel',
         title: hotel ? `Overnight at ${hotel.name}` : `Overnight in ${destination}`,
@@ -978,10 +1091,10 @@ export function buildDaysPlan({
         address: hotel?.address || '',
         coordinates: hotel?.latitude != null ? { lat: Number(hotel.latitude), lng: Number(hotel.longitude) } : null,
         cost: {
-          amount: Math.round(hotelNightly * rooms * 100) / 100,
+          amount: overnightAmount,
           currency: hotel?.price?.currency || currency,
           isEstimate: !hotelPlan.isLive,
-          perPerson: Math.round((hotelNightly * rooms) / partySize * 100) / 100,
+          perPerson: Math.round((overnightAmount / partySize) * 100) / 100,
           estimateNote: hotelPlan.isLive ? `Live price · ${hotelNightly}/room/night × ${rooms} room(s)` : `Estimated ${hotelNightly}/room/night × ${rooms} room(s)`,
         },
         source: hotelPlan.isLive ? 'amadeus-hotels' : 'budget-estimate', isLive: hotelPlan.isLive,
@@ -1049,6 +1162,25 @@ export function buildDaysPlan({
     }
     addTravelLegs(activities, base);
 
+    // Price the "Local transport & transfers" row from the day's real travel
+    // legs (walking is free, taxi/auto ~₹15/km, bus/metro flat ₹30). Falls
+    // back to the budget-derived daily envelope when legs carry no distance.
+    const localTransportRow = activities.find((a) => a.category === 'transport' && /local transport/i.test(a.title));
+    if (localTransportRow) {
+      const legCost = pricingService.localTransportLegEstimate(activities.map((x) => x.travel));
+      const raw = legCost > 0 ? legCost : localTransportPerDay;
+      const rounded = Math.ceil((raw > 0 ? raw : 80) / 10) * 10;
+      // Never below a realistic daily minimum fare (₹80), and never above the
+      // daily local-transport envelope from the budget allocation.
+      const dailyCap = localTransportPerDay > 0 ? Math.max(80, localTransportPerDay) : rounded;
+      const amount = Math.max(80, Math.min(rounded, dailyCap));
+      localTransportRow.cost.amount = amount;
+      localTransportRow.cost.perPerson = Math.round((amount / partySize) * 100) / 100;
+      localTransportRow.cost.estimateNote = legCost > 0
+        ? `Estimated from ${activities.filter((x) => x.travel && x.travel.distanceKm > 0).length} intra-day travel leg(s)`
+        : 'Estimated from transport budget';
+    }
+
     // ---- Daily cost breakdown + cumulative ----
     const breakdown = { accommodation: 0, breakfast: 0, lunch: 0, dinner: 0, transport: 0, activities: 0, evening: 0, night: 0, misc: 0 };
     for (const a of activities) {
@@ -1058,7 +1190,7 @@ export function buildDaysPlan({
       else if (a.category === 'restaurant' && slot === 'breakfast') breakdown.breakfast += amt;
       else if (a.category === 'restaurant' && slot === 'lunch') breakdown.lunch += amt;
       else if (a.category === 'restaurant') breakdown.dinner += amt;
-      else if (a.category === 'transport') breakdown.transport += amt;
+      else if (['transport', 'flight', 'train', 'bus'].includes(a.category)) breakdown.transport += amt;
       else if (slot === 'evening') breakdown.evening += amt;
       else if (slot === 'night') breakdown.night += amt;
       else if (a.category === 'attraction' || a.category === 'activity') breakdown.activities += amt;
@@ -1114,13 +1246,39 @@ export function buildDaysPlan({
       remainingBudget,
       dayCostIsEstimate: true,
     };
-  });
-
-  // ---- Post-build duplicate validation ----
+  });  // ---- Post-build duplicate validation ----
   // Verify no sightseeing attraction repeats across days. Hotels are allowed
   // to repeat (same hotel for multi-night stay). Restaurants and attractions
   // should NOT repeat.
   validateNoDuplicateAttractions(days);
+
+  // ---- Final pricing pass: ensure every displayable item has a price ----
+  // Run normalizeItineraryPrices so any item that slipped through with amount 0
+  // (except genuinely free attractions / check-out) gets a category estimate.
+  // Pass the per-day envelopes so transport/local-transport estimates stay within budget.
+  const perDayTransport = Math.round((allocation.transport?.amount || 0) * 0.3 / Math.max(1, dates.length) * 100) / 100;
+  const perDayFood = Math.round((allocation.food?.amount || 0) / dates.length * 100) / 100;
+  for (const day of days) {
+    for (const act of day.activities || []) {
+      const ctx = {
+        partySize,
+        currency,
+        hotelNightly,
+        hotelDaily: daily.perDay.hotelPerRoomNight,
+        rooms,
+        localTransportDaily: perDayTransport,
+        maxTravelCost: perDayTransport,
+        maxMealPerPerson: mealPerPersonCap,
+        maxActivityPerPerson: activityPerPersonCap,
+        maxHotelNightly: daily.perDay.hotelPerRoomNight || 0,
+        outboundEstimate,
+      };
+      pricingService.normalizeActivityCost(act, ctx);
+    }
+  }
+  // Normalization may have updated item prices — recompute day totals from the
+  // actual item costs so day totals always equal the sum of displayed prices.
+  finalizeDayCosts(days, { partySize, totalBudget });
 
   // ---- Hard budget enforcement (before returning, so the stored total is
   //      always <= the user's budget when a budget was provided) ----
@@ -1167,7 +1325,7 @@ export function finalizeDayCosts(days, { partySize, totalBudget } = {}) {
       else if (a.category === 'restaurant' && slot === 'breakfast') breakdown.breakfast += amt;
       else if (a.category === 'restaurant' && slot === 'lunch') breakdown.lunch += amt;
       else if (a.category === 'restaurant') breakdown.dinner += amt;
-      else if (a.category === 'transport') breakdown.transport += amt;
+      else if (['transport', 'flight', 'train', 'bus'].includes(a.category)) breakdown.transport += amt;
       else if (slot === 'evening') breakdown.evening += amt;
       else if (slot === 'night') breakdown.night += amt;
       else if (a.category === 'attraction' || a.category === 'activity') breakdown.activities += amt;
@@ -1248,8 +1406,12 @@ export function toCostItems(days, currency) {
         title: act.title,
         amount: act.cost?.amount || 0,
         currency: act.cost?.currency || currency,
-        droppable: (act.priority || 1) > 1 && !act.isLive, // never drop live bookings
-        flexible: act.category === 'restaurant' || act.category === 'activity' || act.category === 'transport',
+        // Nothing is ever dropped/zeroed (a removed item would render as
+        // "Free" for something that is not free). Only ESTIMATED costs are
+        // flexible so the optimizer can reduce them; live/verified prices
+        // (flights, Viator, Zomato, live hotels) stay untouched.
+        droppable: false,
+        flexible: act.cost?.isEstimate !== false && !act.isLive,
         priority: act.priority || 1,
       });
     });

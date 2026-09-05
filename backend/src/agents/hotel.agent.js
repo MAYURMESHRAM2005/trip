@@ -1,11 +1,12 @@
 import hotelProvider from '../providers/hotel.provider.js';
+import { curatedPlaces, validatePlaceForDestination } from '../services/destination.service.js';
 import logger from '../utils/logger.js';
 
 /**
- * Hotel Agent: real offers from Amadeus first; heuristic recommendation.
- * If Amadeus is unavailable the itinerary will state that clearly and use a
- * budget-derived estimate for accommodation, flagged as an estimate.
- * No Gemini calls — selection is heuristic-based.
+ * Hotel Agent: real offers from Amadeus first, validated against the
+ * destination; destination-specific curated hotels fill the gap when Amadeus
+ * is unavailable or returns out-of-region/zero-price results. Curated hotels
+ * carry estimated pricing and are never presented as live.
  */
 class HotelAgent {
   constructor() {
@@ -16,11 +17,11 @@ class HotelAgent {
   get systemPrompt() { return this._systemPrompt; }
   set systemPrompt(v) { this._systemPrompt = v; }
 
-  async run({ destination, checkIn, checkOut, adults, rooms, maxPrice, totalBudget, hotelPreference }) {
-    logger.entry('[AGENT:hotel]', 'run', { destination, checkIn, checkOut, adults, rooms, maxPrice });
+  async run({ destination, checkIn, checkOut, adults, rooms, maxPrice, totalBudget, hotelPreference, destinationInfo }) {
+    logger.entry('[AGENT:hotel]', 'run', { destination, checkIn, checkOut, adults, rooms, maxPrice, hasDestInfo: Boolean(destinationInfo) });
     const started = Date.now();
     const providerResult = await hotelProvider.searchHotels({
-      city: destination,
+      city: destinationInfo?.city || destination,
       checkIn,
       checkOut,
       adults,
@@ -29,39 +30,42 @@ class HotelAgent {
       limit: 12,
     });
 
-    if (!providerResult.isLive) {
-      logger.warn(`[AGENT:hotel] Provider not live: ${providerResult.message}`);
-      return {
-        agent: this.name,
-        status: 'degraded',
-        data: {
-          hotels: [],
-          recommended: null,
-          isLive: false,
-          source: 'none',
-          message: providerResult.message,
-          estimatedNightly: null,
-        },
-        message: providerResult.message,
-        latencyMs: 0,
-        usedAI: false,
-        source: 'provider',
-      };
+    // ── 1. Live Amadeus offers, validated against the destination ──
+    let liveHotels = providerResult.isLive ? (providerResult.data || []) : [];
+    if (destinationInfo?.latitude != null) {
+      const kept = [];
+      for (const h of liveHotels) {
+        const res = validatePlaceForDestination(h, destinationInfo, { category: 'hotel' });
+        // Keep hotels that pass, or that we cannot geolocate (no coords) — but
+        // drop any that are clearly outside the destination region.
+        if (res.valid || res.reason === 'missing-coordinates') kept.push(h);
+        else logger.warn(`[AGENT:hotel] Rejected out-of-region hotel "${h.name}" (${res.reason}${res.distanceKm ? ` ${res.distanceKm}km` : ''})`);
+      }
+      liveHotels = kept;
     }
 
-    const hotels = providerResult.data || [];
+    // ── 2. Curated destination hotels fill the gap ──
+    const curated = curatedPlaces(destinationInfo, 'hotels');
+    const seen = new Set(liveHotels.map((h) => String(h.name || '').toLowerCase()).filter(Boolean));
+    for (const c of curated) {
+      if (seen.has(String(c.name || '').toLowerCase())) continue;
+      liveHotels.push(c);
+      seen.add(String(c.name || '').toLowerCase());
+    }
 
-    // Heuristic: best value = cheapest price that fits the budget
-    // If maxPrice is set, prefer hotels within budget; otherwise sort by price
+    const hotels = liveHotels;
+    const curatedCount = hotels.filter((h) => h.source === 'curated').length;
+    const liveCount = hotels.length - curatedCount;
+    const hasLive = liveCount > 0;
+
+    // ── 3. Heuristic: best value = cheapest price that fits the budget ──
     let recommended = null;
     let alternatives = [];
 
     if (hotels.length > 0) {
-      // Sort by price (cheapest first), with nulls at the end
       const withPrice = hotels.filter((h) => h.price?.amount);
       const withoutPrice = hotels.filter((h) => !h.price?.amount);
 
-      // Within budget first, then by price
       const withinBudget = withPrice.filter(
         (h) => !maxPrice || h.price.amount <= maxPrice * 1.05
       );
@@ -76,18 +80,17 @@ class HotelAgent {
       recommended = sorted[0] || null;
       alternatives = sorted.slice(1, 4);
 
-      // If preference is specified, try to find a match
       if (hotelPreference && recommended) {
         const prefMatch = sorted.find(
           (h) => h.name?.toLowerCase().includes(hotelPreference.toLowerCase())
         );
-        if (prefMatch && prefMatch !== recommended) {
-          // Keep current recommended, but note the preference match exists
-        }
+        if (prefMatch) recommended = prefMatch;
       }
     }
 
-    logger.exit('[AGENT:hotel]', 'run', { status: 'success', hotelCount: hotels.length, recommended: recommended?.name || 'none', latencyMs: Date.now() - started });
+    if (!recommended && hotels.length) recommended = hotels[0];
+
+    logger.exit('[AGENT:hotel]', 'run', { status: 'success', hotelCount: hotels.length, live: liveCount, curated: curatedCount, recommended: recommended?.name || 'none', latencyMs: Date.now() - started });
     return {
       agent: this.name,
       status: 'success',
@@ -95,11 +98,13 @@ class HotelAgent {
         hotels,
         recommended,
         alternatives,
-        isLive: true,
-        source: 'amadeus-hotels',
-        message: providerResult.message,
+        isLive: hasLive,
+        source: hasLive ? 'amadeus-hotels' : 'curated',
+        message: hasLive
+          ? providerResult.message
+          : `Live hotel data unavailable or out-of-region — using ${curatedCount} curated destination hotel(s) with estimated pricing.`,
       },
-      message: `Hotel data from provider (${hotels.length} offers)`,
+      message: `Hotel data (${liveCount} live, ${curatedCount} curated, ${recommended?.name || 'none'} recommended)`,
       latencyMs: Date.now() - started,
       usedAI: false,
       source: 'provider',
