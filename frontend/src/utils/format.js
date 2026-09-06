@@ -54,11 +54,6 @@ export function formatDateShort(date) {
   return d.toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' });
 }
 
-export function formatTime(time) {
-  if (!time) return '';
-  return time;
-}
-
 export function daysBetween(start, end) {
   const a = new Date(start);
   const b = new Date(end);

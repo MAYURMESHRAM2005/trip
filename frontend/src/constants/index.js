@@ -29,8 +29,6 @@ export const EXPENSE_CATEGORIES = [
   { value: 'other', label: 'Other' },
 ];
 
-export const TICKET_CATEGORIES = ['flight', 'train', 'bus', 'hotel', 'attraction'];
-
 export const INTERESTS = [
   'Beaches', 'Mountains', 'Heritage', 'Food', 'Adventure', 'Shopping',
   'Nightlife', 'Temples', 'Nature', 'Wildlife', 'Art', 'Spiritual', 'Photography', 'Festivals',

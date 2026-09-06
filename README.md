@@ -2,7 +2,7 @@
 
 **AI-Powered Smart Travel Assistant & Planner using Multi-Agent LLM Architecture and Budget Optimizer**
 
-A production-grade full-stack MERN application where **17 specialized AI agents** (Gemini) plan day-by-day itineraries from **real provider data** — and honestly say **"Live data unavailable"** when a provider is not configured. Nothing is ever fabricated.
+A production-grade full-stack MERN application where **18 specialized AI agents** (Gemini) plan day-by-day itineraries from **real provider data** — and honestly say **"Live data unavailable"** when a provider is not configured. Nothing is ever fabricated.
 
 ```
 root/
@@ -17,7 +17,7 @@ root/
 ## ⚡ Highlights
 
 - **Real authentication** — JWT access tokens (memory) + rotating refresh tokens (httpOnly cookies), bcrypt password hashing, email verification, forgot/reset password, Google sign-in via Firebase Authentication, RBAC (`user` / `admin`).
-- **Multi-Agent LLM architecture** — Orchestrator, User Preference, Destination, Budget, Flight, Train, Bus, Hotel, Restaurant, Attraction, Weather, Traffic, Local Guide, Safety, Expense, Translation, Final Validator. External-data agents fetch **real data first** (AviationStack, Amadeus, Geoapify Places, OpenWeatherMap) and Gemini only *reasons* over it.
+- **Multi-Agent LLM architecture** — Orchestrator, User Preference, Destination, Budget, Flight, Train, Bus, Hotel, Restaurant, Attraction, Cultural Events, Weather, Traffic, Local Guide, Safety, Expense, Translation, Final Validator. External-data agents fetch **real data first** (AviationStack, Amadeus, Geoapify Places, Viator, Zomato, Ticketmaster, OpenWeatherMap) and Gemini only *reasons* over it.
 - **Deterministic Budget Optimizer** — allocation and optimization are plain arithmetic (tested), not LLM guesswork. Drops low-priority items and reduces flexible costs when over budget, showing original vs optimized vs saved.
 - **Final Validator Agent** — verifies budget ≤ limit, date consistency, time overlaps, hotel/transport/restaurant fit, and that estimates/live data are correctly labelled.
 - **Everything else** — interactive Leaflet maps with traffic-aware routes, hotels, flights, trains, buses, restaurants, weather, contextual chatbot that really edits your trip, voice assistant, image search, expense tracker with charts, PWA offline itinerary, emergency center, QR ticket wallet, PDF itinerary, multi-language (en/hi/mr), and a full admin dashboard.
@@ -67,8 +67,8 @@ Validated Trip + Itinerary (persisted in MongoDB)
 | Frontend | React 18, Vite 5, Tailwind CSS 3, React Router 6, TanStack React Query, Zustand, Axios, Framer Motion, Recharts, Lucide, React Hook Form + Zod, Leaflet, qrcode.react, Vitest |
 | Backend | Node 18+, Express, Mongoose, JWT, bcryptjs, cookie-parser, helmet, cors, express-rate-limit, compression, morgan, Joi, multer, nodemailer, pdfkit, @google/generative-ai, node:test + supertest |
 | Database | MongoDB (local or Atlas) |
-| AI | Google Gemini **3.5 Flash** (`gemini-3.5-flash` default, configurable via `GEMINI_MODEL`) |
-| APIs | AviationStack (flights), Amadeus (hotels), Geoapify (geocoding, routing, places), OpenWeatherMap, open.er-api.com (FX), configurable train/bus endpoints |
+| AI | Google Gemini **3.5 Flash** (`gemini-3.5-flash` default, configurable via `GEMINI_MODEL`), Groq (fallback) |
+| APIs | AviationStack (flights), Amadeus (hotels), Geoapify (geocoding, routing, places), Viator (attraction pricing), Zomato (restaurant pricing), Ticketmaster (cultural events), OpenWeatherMap, open.er-api.com (FX), configurable train/bus endpoints |
 
 ---
 
@@ -129,6 +129,9 @@ npm start                # runs the backend (serve frontend/dist with any static
 | `OPENWEATHER_API_KEY` | Weather (server-side proxy) |
 | `AVIATIONSTACK_API_KEY` | Flights (free tier at aviationstack.com) |
 | `AMADEUS_CLIENT_ID` / `AMADEUS_CLIENT_SECRET` | Hotels |
+| `VIATOR_API_KEY` | Attraction pricing and tours |
+| `ZOMATO_API_KEY` | Restaurant pricing and ratings |
+| `TICKETMASTER_API_KEY` | Cultural events during trip |
 | `FIREBASE_PROJECT_ID` / `FIREBASE_SERVICE_ACCOUNT` | Firebase Authentication (Google sign-in) — backend |
 | `TRAIN_API_URL` / `TRAIN_API_KEY` / `TRAIN_API_ENDPOINT` | Optional configured train provider — `https://` is auto-added; RapidAPI hosts use `x-rapidapi-key`; `TRAIN_API_ENDPOINT` (default `/search`) is the search path |
 | `BUS_API_URL` / `BUS_API_KEY` / `BUS_API_ENDPOINT` | Optional configured bus provider (same rules as trains) |
@@ -148,7 +151,7 @@ mongod --dbpath ./data/db
 # or Atlas: create a cluster, copy the SRV string into MONGODB_URI
 ```
 
-Models: `User`, `RefreshToken`, `UserPreference`, `Trip`, `Itinerary`, `ItineraryDay` (embedded), `Expense`, `SavedPlace`, `Notification`, `Ticket`, `AIConversation`, `EmergencyContact`, `AiUsageLog` — all with validation, timestamps and indexes.
+Models: `User`, `RefreshToken`, `UserPreference`, `Trip`, `Itinerary`, `ItineraryDay`, `Expense`, `SavedPlace`, `Notification`, `Ticket`, `AIConversation`, `EmergencyContact`, `AiUsageLog` — all with validation, timestamps and indexes.
 
 ---
 
@@ -157,11 +160,14 @@ Models: `User`, `RefreshToken`, `UserPreference`, `Trip`, `Itinerary`, `Itinerar
 | Provider | Where | Docs |
 | --- | --- | --- |
 | Gemini | [Google AI Studio](https://aistudio.google.com/app/apikey) | [Generative AI docs](https://ai.google.dev/gemini-api/docs) |
-| Geoapify | [myprojects.geoapify.com](https://myprojects.geoapify.com) → create a key; use a referrer-restricted browser key for the frontend | [Geoapify docs](https://apidocs.geoapify.com) |
+| Geoapify | [myprojects.geoapify.com](https://myprojects.geoapify.com) → create a key | [Geoapify docs](https://apidocs.geoapify.com) |
 | OpenWeatherMap | [openweathermap.org](https://home.openweathermap.org/api_keys) | [Weather API](https://openweathermap.org/api) |
-| AviationStack | [aviationstack.com](https://aviationstack.com) — free tier (real-time + airport lookup; schedules on paid plan) | [Flight API docs](https://aviationstack.com/documentation) |
+| AviationStack | [aviationstack.com](https://aviationstack.com) — free tier (real-time + airport lookup) | [Flight API docs](https://aviationstack.com/documentation) |
 | Amadeus | [Amadeus for Developers](https://developers.amadeus.com) — free test credentials (hotels) | [Hotel Offers](https://developers.amadeus.com/self-service/category/hotels) |
-| Firebase Auth | [Firebase Console → Authentication](https://console.firebase.google.com/) — enable Google provider, register a web app, create a service account | [Firebase Auth docs](https://firebase.google.com/docs/auth) |
+| Viator | [Viator Partner API](https://www.viator.com/partner-api) — attraction pricing and tours | [Viator API docs](https://docs.viator.com) |
+| Zomato | Zomato API via RapidAPI — restaurant pricing and ratings | [Zomato API docs](https://www.zomato.com/api/documentation) |
+| Ticketmaster | [Ticketmaster Developer](https://developer.ticketmaster.com) — cultural events during trip | [Discovery API docs](https://developer.ticketmaster.com/products-and-docs/apis/discovery-api/) |
+| Firebase Auth | [Firebase Console → Authentication](https://console.firebase.google.com/) — enable Google provider | [Firebase Auth docs](https://firebase.google.com/docs/auth) |
 | Trains/Buses | Any compliant provider — the app calls `${URL}/search` with `{from,to,date,passengers}` | see `backend/src/providers/train.provider.js` |
 
 > Without keys the app still works: every feature shows real live data when available and an honest **"Live data unavailable"** notice (with external booking links) otherwise. Admin → Providers shows exactly what is configured.
@@ -178,7 +184,7 @@ cd backend && npm test
 cd frontend && npm test
 ```
 
-Covered: deterministic budget calculations (allocation sums, style splits, drop/reduce optimization), itinerary builder (day structure, live vs estimate labelling), Final Validator (overlaps, budget overflow, clean passes), health/404/validation routes, and a full register→trip-generate→optimize→logout flow (auto-skips when `mongodb-memory-server` isn't installed).
+Covered: deterministic budget calculations (allocation sums, style splits, drop/reduce optimization), itinerary builder (day structure, live vs estimate labelling), Final Validator (overlaps, budget overflow, clean passes), health/404/validation routes, pricing, transport intelligence, destination validation, and a full register→trip-generate→optimize→logout flow (auto-skips when `mongodb-memory-server` isn't installed).
 
 ---
 
@@ -186,29 +192,30 @@ Covered: deterministic budget calculations (allocation sums, style splits, drop/
 
 ```
 backend/src/
-├── config/        env, db
-├── controllers/   HTTP handlers (no business logic)
-├── routes/        Express routers + Joi validation
-├── services/      auth, gemini, budget (deterministic), itinerary, chat, pdf, email, translate…
-├── agents/        17 agent modules (provider-first, AI-second)
-├── orchestrator/  tripOrchestrator.js — the pipeline
-├── providers/     flight, train, bus, hotel, places, weather, maps, currency (abstraction layer)
-├── models/        Mongoose models
-├── middleware/    auth, RBAC, rate limit, validation, error handling, upload
-├── validators/    Joi schemas
+├── config/        env, db, firebase-admin
+├── controllers/   21 HTTP handlers (auth, admin, trip, hotel, flight, train, bus, restaurant, place, map, chat, voice, expense, ticket, emergency, notification, translate, currency, weather, health, user)
+├── routes/        23 Express routers + Joi validation
+├── services/      auth, gemini, groq, budget (deterministic), itinerary, itineraryGenerator, chat, pdf, email, translate, pricing, transportIntelligence, notification, destination, budgetEngine, aiUsage, firebase
+├── agents/        18 agent modules (orchestrator + 17 specialists, provider-first AI-second)
+├── orchestrator/  tripOrchestrator.js (main pipeline), orchestratorAIPlanning.js (AI planning)
+├── providers/     14 providers (base, flight, train, bus, hotel, places, weather, maps, currency, ignav, pay2all, viator, zomato, ticketmaster)
+├── models/        13 Mongoose models (User, Trip, Itinerary, ItineraryDay, Expense, etc.)
+├── middleware/     auth, RBAC, rate limit, validation, error handling, upload
+├── validators/    auth, trip, general Joi schemas
 ├── prompts/       agent system prompts
+├── data/          curatedDestinations.js
 ├── jobs/          periodic cleanup
 └── app.js, server.js
 
 frontend/src/
-├── components/    ui kit + layout (Sidebar, Topbar) + feature components
-├── pages/         29 pages (auth, dashboard, planner, itinerary, budget, transport…)
-├── services/      axios instance + typed API client
-├── store/         zustand (auth, theme)
-├── hooks/         useSpeech, useOnline, useTripId…
+├── components/    ui kit (Button, Card, Badge, Modal, Input, Spinner, StatCard, EmptyState, PageHeader) + layout (Sidebar, MainLayout, AuthLayout) + feature (AgentPipeline, GlobalSearch, ItineraryTimeline, MapView, PlaceAutocomplete, ProviderNotice, TripSelect) + itinerary sub-components
+├── pages/         31 pages (auth, dashboard, planner, itinerary, budget, transport, chat, voice, expenses, emergency, QR tickets, admin…)
+├── services/      api.js (axios instance + token refresh), apiClient.js (typed endpoints), firebase, geoapifyService, weatherService
+├── store/         zustand (authStore, themeStore)
+├── hooks/         useSpeech, useOnline, useTripId
 ├── utils/         format, i18n (en/hi/mr), geo
-├── constants/     nav, agents, options
-└── router/        protected routes
+├── constants/     nav, agents, options, currencies, travel styles
+└── router/        AppRouter.jsx with protected routes
 ```
 
 ---
