@@ -69,3 +69,28 @@
   background-clip: text;
   color: transparent;
 }
+
+/* ---- Mobile web app hardening ------------------------------------ */
+
+/* iOS Safari auto-zooms into any focused input whose font-size is below 16px.
+   Bump inputs/selects on phones only so the page never jumps on tap. */
+@media (max-width: 640px) {
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+}
+
+/* Safe-area insets for notched phones when installed as a PWA (standalone).
+   env() evaluates to 0 in regular browser tabs, so these are no-ops unless
+   the page is fullscreen on a device with notches / a home indicator. */
+.pt-safe {
+  padding-top: env(safe-area-inset-top);
+}
+
+@supports (padding: env(safe-area-inset-bottom)) {
+  body {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}

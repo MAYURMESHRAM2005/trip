@@ -10,7 +10,7 @@ export default function AuthLayout() {
   const { t } = useI18n();
   return (
     <div className="gradient-hero flex min-h-screen flex-col">
-      <header className="flex items-center justify-between px-6 py-5">
+      <header className="pt-safe flex items-center justify-between px-6 py-5">
         <Link to="/" className="flex items-center gap-2.5">
           <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-brand-500 to-brand-700 text-white shadow-card">
             <Plane className="h-5 w-5" />

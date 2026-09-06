@@ -5,7 +5,17 @@
  * - Live-only features clearly fail with "Live data unavailable" while offline
  */
 const VERSION = 'travelmind-v1';
-const APP_SHELL = ['/', '/index.html', '/manifest.webmanifest', '/icons/icon.svg', '/icons/icon-maskable.svg'];
+const APP_SHELL = [
+  '/',
+  '/index.html',
+  '/manifest.webmanifest',
+  '/icons/icon.svg',
+  '/icons/icon-maskable.svg',
+  '/icons/icon-192.png',
+  '/icons/icon-512.png',
+  '/icons/icon-maskable-512.png',
+  '/icons/apple-touch-icon.png',
+];
 const ITINERARY_CACHE = 'travelmind-itinerary-cache';
 const SHELL_CACHE = 'travelmind-shell-cache';
 

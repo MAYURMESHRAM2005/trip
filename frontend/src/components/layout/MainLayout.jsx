@@ -40,7 +40,7 @@ export default function MainLayout() {
 
       <div className="lg:pl-64">
         {/* Topbar */}
-        <header className="sticky top-0 z-20 flex h-16 items-center justify-between border-b border-slate-200/80 bg-white/80 px-4 backdrop-blur-xl dark:border-slate-800 dark:bg-slate-900/80 sm:px-6">
+        <header className="pt-safe sticky top-0 z-20 flex h-16 items-center justify-between border-b border-slate-200/80 bg-white/80 px-4 backdrop-blur-xl dark:border-slate-800 dark:bg-slate-900/80 sm:px-6">
           <div className="flex min-w-0 flex-1 items-center gap-3">
             <button
               onClick={() => setSidebarOpen(true)}
