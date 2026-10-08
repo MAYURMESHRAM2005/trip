@@ -22,9 +22,24 @@ function Bootstrap() {
   useEffect(() => {
     useThemeStore.getState().init();
     bootstrap();
-    // PWA: register service worker (only in production build / supported browsers)
-    if ('serviceWorker' in navigator && import.meta.env.PROD) {
-      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    // PWA: register the service worker in production only. In development, make
+    // sure no worker/cache is left over from an earlier production run — a stale
+    // worker can serve an out-of-date module and leave the app blank.
+    if ('serviceWorker' in navigator) {
+      if (import.meta.env.PROD) {
+        navigator.serviceWorker.register('/sw.js').catch(() => {});
+      } else {
+        navigator.serviceWorker
+          .getRegistrations()
+          .then((regs) => Promise.all(regs.map((r) => r.unregister())))
+          .catch(() => {});
+        if (typeof caches !== 'undefined') {
+          caches
+            .keys()
+            .then((keys) => Promise.all(keys.map((k) => caches.delete(k))))
+            .catch(() => {});
+        }
+      }
     }
   }, [bootstrap]);
   return <AppRouter />;

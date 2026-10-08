@@ -46,7 +46,9 @@ function ActivityRow({ activity, currency }) {
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-center gap-2">
           <p className="text-sm font-bold text-slate-900 dark:text-white">{activity.title}</p>
-          <DataStatusBadge status={activity.dataStatus} />
+          {(activity.dataStatus === 'live' || activity.dataStatus === 'curated') && (
+            <DataStatusBadge status={activity.dataStatus} />
+          )}
           {hasMeta && (
             <button
               onClick={() => setShowMeta(!showMeta)}
@@ -110,7 +112,7 @@ function ActivityRow({ activity, currency }) {
       </div>
       <div className="shrink-0 text-right">
         {(() => {
-          const { price, suffix, isEstimate, isFree } = resolveActivityPrice(activity.cost);
+          const { price, suffix, isFree } = resolveActivityPrice(activity.cost);
           if (price === null) {
             // Defensive only — the backend pricing fallback always assigns a
             // price (0 = free) to every displayable item.
@@ -125,9 +127,6 @@ function ActivityRow({ activity, currency }) {
                 {formatCurrency(price, currency)}
                 {suffix ? <span className="text-xs font-semibold text-slate-500 dark:text-slate-400"> {suffix}</span> : ''}
               </p>
-              {isEstimate && (
-                <p className="text-[10px] font-medium uppercase tracking-wide text-amber-500">{t('estimate')}</p>
-              )}
               {activity.cost?.perPerson > 0 && (
                 <p className="text-[10px] text-slate-400">≈ {formatCurrency(activity.cost.perPerson, currency)}{t('/person')}</p>
               )}
@@ -255,10 +254,8 @@ export default function ItineraryTimeline({ days = [], currency = 'INR' }) {
                   <b className="text-slate-800 dark:text-slate-100">{formatCurrency(day.overnight.total, currency)}</b>
                 </span>
               )}
-              {day.overnight.isLive ? (
+              {day.overnight.isLive && (
                 <span className="rounded-full bg-emerald-100 px-2 py-0.5 font-semibold text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300">{t('live')}</span>
-              ) : (
-                <span className="rounded-full bg-amber-100 px-2 py-0.5 font-semibold text-amber-700 dark:bg-amber-950 dark:text-amber-300">{t('estimated')}</span>
               )}
             </div>
           )}
