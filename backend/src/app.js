@@ -10,6 +10,7 @@ import { apiLimiter } from './middleware/rateLimiter.js';
 import { httpLogger } from './utils/logger.js';
 
 const app = express();
+app.set('trust proxy', 1);
 
 // Security headers
 app.use(helmet());
