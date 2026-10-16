@@ -1,10 +1,20 @@
 /* TravelMind AI Service Worker
- * - App shell: cache-first (offline capable UI)
+ * - Navigations / HTML: network-first, so a new deployment is picked up on the
+ *   next load (a cache-first shell kept every browser on the bundle from its
+ *   first visit, which meant shipped fixes never reached users). Falls back to
+ *   the cached shell when offline.
+ * - /assets/*, /icons/*: cache-first. Safe because Vite fingerprints those
+ *   filenames, so a cached copy is always the copy its shell asked for.
  * - API: network-first with cache fallback for GET requests
  * - Itinerary data: cached so trips stay viewable offline
  * - Live-only features clearly fail with "Live data unavailable" while offline
+ *
+ * Bump VERSION whenever the precache list or handler behaviour changes: the
+ * activate handler deletes every other `travelmind-*` cache.
  */
-const VERSION = 'travelmind-v1';
+const VERSION = 'v2';
+const SHELL_CACHE = `travelmind-shell-${VERSION}`;
+const ITINERARY_CACHE = 'travelmind-itinerary-cache';
 const APP_SHELL = [
   '/',
   '/index.html',
@@ -16,8 +26,7 @@ const APP_SHELL = [
   '/icons/icon-maskable-512.png',
   '/icons/apple-touch-icon.png',
 ];
-const ITINERARY_CACHE = 'travelmind-itinerary-cache';
-const SHELL_CACHE = 'travelmind-shell-cache';
+const IMMUTABLE_PREFIXES = ['/assets/', '/icons/'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -38,6 +47,31 @@ self.addEventListener('activate', (event) => {
       .then(() => self.clients.claim())
   );
 });
+
+function cacheShell(request, response) {
+  if (response && response.ok) {
+    const clone = response.clone();
+    // Keyed by URL: a navigation Request cannot be used as a Cache key.
+    caches.open(SHELL_CACHE).then((cache) => cache.put(request.url, clone));
+  }
+  return response;
+}
+
+/**
+ * Network-first for the document itself. A non-OK answer (a host that 404s a
+ * client-side route) must not break the SPA, so fall back to the shell too.
+ */
+async function networkFirstShell(request) {
+  try {
+    const response = await fetch(request);
+    if (response.ok) return cacheShell(request, response);
+    const shell = await caches.match('/index.html');
+    return shell || response;
+  } catch {
+    const cached = await caches.match(request);
+    return cached || (await caches.match('/index.html')) || offlineResponse('You are offline');
+  }
+}
 
 self.addEventListener('fetch', (event) => {
   const { request } = event;
@@ -68,19 +102,19 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Static assets / app shell: cache-first, network fallback
+  // The document: always ask the network first so a new build wins
+  if (request.mode === 'navigate' || url.pathname === '/' || url.pathname.endsWith('.html') || url.pathname === '/manifest.webmanifest') {
+    event.respondWith(networkFirstShell(request));
+    return;
+  }
+
+  // Static assets: cache-first, refreshed from the network on the next visit
   event.respondWith(
     caches.match(request).then(
       (cached) =>
         cached ||
         fetch(request)
-          .then((response) => {
-            if (response.ok && (url.pathname.startsWith('/assets/') || APP_SHELL.includes(url.pathname))) {
-              const clone = response.clone();
-              caches.open(SHELL_CACHE).then((cache) => cache.put(request, clone));
-            }
-            return response;
-          })
+          .then((response) => (IMMUTABLE_PREFIXES.some((p) => url.pathname.startsWith(p)) ? cacheShell(request, response) : response))
           .catch(() => caches.match('/index.html'))
     )
   );

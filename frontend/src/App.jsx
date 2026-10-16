@@ -7,6 +7,25 @@ import { useThemeStore } from './store/themeStore';
 import { useAuthStore } from './store/authStore';
 import { I18nProvider } from './utils/i18n';
 
+// Guards the update reload below so a new worker can never start a reload loop.
+let updateReloadScheduled = false;
+
+/**
+ * Reload once when a newly deployed worker takes control of a page that an
+ * older worker was already serving. Without this, the tab keeps running the
+ * previous bundle until the user closes it, which hides deployed fixes.
+ */
+function watchForServiceWorkerUpdate() {
+  if (updateReloadScheduled) return;
+  updateReloadScheduled = true;
+  // A first-ever install also fires controllerchange; there is nothing stale to
+  // replace then, and reloading would be a pointless flash on first visit.
+  const wasControlled = Boolean(navigator.serviceWorker.controller);
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (wasControlled) window.location.reload();
+  });
+}
+
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
@@ -27,7 +46,13 @@ function Bootstrap() {
     // worker can serve an out-of-date module and leave the app blank.
     if ('serviceWorker' in navigator) {
       if (import.meta.env.PROD) {
-        navigator.serviceWorker.register('/sw.js').catch(() => {});
+        // updateViaCache: 'none' keeps the browser from answering the sw.js
+        // update check out of its HTTP cache, so a new deploy is seen at once.
+        navigator.serviceWorker
+          .register('/sw.js', { updateViaCache: 'none' })
+          .then((reg) => reg.update().catch(() => {}))
+          .catch(() => {});
+        watchForServiceWorkerUpdate();
       } else {
         navigator.serviceWorker
           .getRegistrations()

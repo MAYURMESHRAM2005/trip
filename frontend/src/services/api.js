@@ -10,7 +10,18 @@ import { useAuthStore } from '../store/authStore';
  */
 export function resolveBaseUrl() {
   const raw = String(import.meta.env.VITE_API_URL || '').trim().replace(/\/+$/, '');
-  if (raw === '') return '/api';
+  if (raw === '') {
+    // A production build without VITE_API_URL sends every request to the
+    // static host, where no API is mounted. Say so loudly instead of leaving a
+    // mysterious 404 in the network tab.
+    if (import.meta.env.PROD) {
+      console.error(
+        '[API] VITE_API_URL is missing for this build, falling back to /api. ' +
+          'Set it to the backend origin (e.g. https://your-api.onrender.com) and redeploy.'
+      );
+    }
+    return '/api';
+  }
   return raw.endsWith('/api') ? raw : `${raw}/api`;
 }
 
