@@ -38,6 +38,15 @@ export class ApiError extends Error {
   static internal(message = 'Internal server error') {
     return new ApiError(500, message, undefined, false);
   }
+
+  /**
+   * A dependency the request needs is unavailable or not configured on this
+   * server (e.g. Firebase Admin credentials missing). Operational, so the
+   * message is safe to show - it tells the operator what to fix.
+   */
+  static serviceUnavailable(message = 'Service unavailable') {
+    return new ApiError(503, message);
+  }
 }
 
 export default ApiError;

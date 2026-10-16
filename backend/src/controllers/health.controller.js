@@ -4,6 +4,7 @@ import mongoose from 'mongoose';
 import logger from '../utils/logger.js';
 import { geminiConfigured } from '../services/gemini.service.js';
 import { groqConfigured } from '../services/groq.service.js';
+import { isFirebaseConfigured } from '../services/firebase.service.js';
 import { providerStatuses } from '../providers/index.js';
 
 export const health = asyncHandler(async (_req, res) => {
@@ -17,6 +18,8 @@ export const health = asyncHandler(async (_req, res) => {
       database: dbState,
       ai: geminiConfigured ? 'configured' : 'not-configured',
       aiFallback: groqConfigured ? 'configured' : 'not-configured',
+      // Google sign-in needs Firebase Admin credentials on the server.
+      firebase: isFirebaseConfigured() ? 'configured' : 'not-configured',
       providers: providerStatuses(),
     })
   );
