@@ -34,8 +34,7 @@ api.interceptors.response.use(
       try {
         if (!refreshPromise) {
           refreshPromise = axios
-             .post('/auth/refresh', null, { withCredentials: true })
-            // .post('/api/auth/refresh', null, { withCredentials: true })
+            .post('/api/auth/refresh', null, { withCredentials: true })
             .then(({ data }) => {
               const token = data?.data?.accessToken;
               useAuthStore.getState().setToken(token);
