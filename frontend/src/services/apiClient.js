@@ -1,4 +1,4 @@
-import api from './api';
+import api, { resolveBaseUrl } from './api';
 import { useAuthStore } from '../store/authStore';
 
 /**
@@ -181,8 +181,7 @@ export const healthApi = {
  * backend), without navigating the browser or opening a blank tab.
  */
 async function downloadBlob(urlPath, filename) {
-  const base = import.meta.env.VITE_API_URL || '/api';
-  const url = `${base}${urlPath}`;
+  const url = `${resolveBaseUrl()}${urlPath}`;
   const token = useAuthStore.getState().accessToken;
   const headers = token ? { Authorization: `Bearer ${token}` } : {};
   const res = await fetch(url, { credentials: 'include', headers });

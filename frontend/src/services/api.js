@@ -1,8 +1,32 @@
 import axios from 'axios';
 import { useAuthStore } from '../store/authStore';
 
+/**
+ * Resolve the backend base URL. Every server route is mounted under `/api` and
+ * Vite inlines VITE_API_URL at build time. Normalising the value here means a
+ * value of "https://host" or "https://host/" still targets "https://host/api"
+ * (instead of silently hitting the frontend origin, which 404s), and never
+ * duplicates the prefix into "/api/api".
+ */
+export function resolveBaseUrl() {
+  const raw = String(import.meta.env.VITE_API_URL || '').trim().replace(/\/+$/, '');
+  if (raw === '') return '/api';
+  return raw.endsWith('/api') ? raw : `${raw}/api`;
+}
+
+const baseURL = resolveBaseUrl();
+
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL || '/api',
+  baseURL,
+  withCredentials: true,
+  timeout: 60000,
+});
+
+// Same base URL as the main client, but a separate instance with no
+// interceptors. The interceptor below uses it to refresh tokens, so a failing
+// refresh can never recursively re-enter the refresh logic and loop forever.
+const refreshClient = axios.create({
+  baseURL,
   withCredentials: true,
   timeout: 60000,
 });
@@ -33,8 +57,8 @@ api.interceptors.response.use(
       original._retry = true;
       try {
         if (!refreshPromise) {
-          refreshPromise = axios
-            .post('/api/auth/refresh', null, { withCredentials: true })
+          refreshPromise = refreshClient
+            .post('/auth/refresh')
             .then(({ data }) => {
               const token = data?.data?.accessToken;
               useAuthStore.getState().setToken(token);

@@ -11,12 +11,22 @@ import {
   hashToken,
   generateVerificationToken,
 } from '../utils/token.js';
-import env from '../config/env.js';
+import env, { isProduction } from '../config/env.js';
 import emailService from './email.service.js';
 import { verifyFirebaseIdToken } from './firebase.service.js';
 import logger from '../utils/logger.js';
 
 const REFRESH_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Cookie policy. In production the frontend (Vercel) and the API (Render) are
+ * different sites: a SameSite=Lax cookie is NOT sent on cross-site XHR/fetch,
+ * so the refresh cookie would arrive missing and /api/auth/refresh would 401.
+ * Cross-site cookies must be SameSite=None + Secure (browsers reject None
+ * without Secure). Development keeps the original Lax behaviour.
+ */
+const COOKIE_SECURE = isProduction || env.COOKIE_SECURE;
+const COOKIE_SAME_SITE = COOKIE_SECURE ? 'none' : 'lax';
 
 function publicUser(user) {
   return {
@@ -227,15 +237,15 @@ export async function firebaseLogin(idToken, req) {
 export function setAuthCookies(res, accessToken, refreshToken) {
   res.cookie('access_token', accessToken, {
     httpOnly: true,
-    secure: env.COOKIE_SECURE,
-    sameSite: 'lax',
+    secure: COOKIE_SECURE,
+    sameSite: COOKIE_SAME_SITE,
     path: '/',
     maxAge: 15 * 60 * 1000,
   });
   res.cookie('refresh_token', refreshToken, {
     httpOnly: true,
-    secure: env.COOKIE_SECURE,
-    sameSite: 'lax',
+    secure: COOKIE_SECURE,
+    sameSite: COOKIE_SAME_SITE,
     path: '/',
     maxAge: REFRESH_TTL_MS,
   });
